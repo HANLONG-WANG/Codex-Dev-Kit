@@ -1,6 +1,6 @@
 # codex-dev-kit
 
-`codex-dev` v0.2.1 is a rootless Podman manager for running Codex inside a Fedora container with a fixed host isolation policy.
+`codex-dev` v0.2.2-local is a rootless Podman manager for running Codex inside a Fedora container with a fixed host isolation policy.
 
 ## Security model
 
@@ -20,6 +20,15 @@
 ./install.sh
 export PATH="$HOME/.local/bin:$PATH"
 codex-dev doctor
+```
+
+`./install.sh` also installs Zsh tab completion for `codex-dev` in your user data directory and adds a small marker block to `.zshrc` when it can do so safely. Open a new Zsh or run `exec zsh` after installing.
+
+Skip controls:
+
+```bash
+CODEX_DEV_SKIP_COMPLETIONS=1 ./install.sh  # do not install completion files or edit .zshrc
+CODEX_DEV_SKIP_RC=1 ./install.sh           # install completion files, but do not edit .zshrc
 ```
 
 ## Typical workflow
@@ -117,6 +126,47 @@ codex-dev volumes <project>
 codex-dev reset-cache <project>
 codex-dev reset-home <project>
 codex-dev nuke-env <project>
+codex-dev completion zsh [--command <absolute-path>]
+```
+
+## Zsh completion
+
+The first completion release is Zsh-only. Bash/Fish completion is intentionally deferred.
+
+After `./install.sh`, a new Zsh can complete:
+
+- top-level commands: `codex-dev <TAB>`
+- command prefixes: `codex-dev sh<TAB>` -> `shell`
+- managed project names: `codex-dev shell <TAB>`
+- profiles: `codex-dev init demo <TAB>`
+- known flags: `codex-dev shell demo <TAB>` -> `--rw-root`
+
+Completion uses `codex-dev __complete` internally. It only reads command-line words and shallow project metadata; it does not call Podman, does not source `.codex-dev/project.env`, does not run build scripts, and does not access the network.
+
+Project completion returns `codex-dev` project names under `${CODEX_DEV_PROJECTS_ROOT:-~/Projects}`, not raw Podman container names. Container names are derived from project names.
+
+Manual installation or troubleshooting:
+
+```bash
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+codex-dev completion zsh --command "$HOME/.local/bin/codex-dev" \
+  > "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_codex-dev"
+```
+
+If your `.zshrc` uses a plugin manager or custom `compinit` flow, source the installed snippet before your existing `compinit`:
+
+```zsh
+source "${XDG_DATA_HOME:-$HOME/.local/share}/codex-dev/zsh-completion.zsh"
+autoload -Uz compinit
+compinit
+```
+
+Useful checks:
+
+```zsh
+echo $fpath
+autoload -Uz compinit && compinit
+whence -w _codex-dev
 ```
 
 ## Profiles

@@ -51,6 +51,7 @@ Usage:
   codex-dev reset-cache <project>
   codex-dev reset-home <project>
   codex-dev nuke-env <project>
+  codex-dev completion zsh [--command <absolute-path>]
 
 Environment overrides:
   CODEX_DEV_PROJECTS_ROOT   default: ~/Projects
@@ -152,6 +153,24 @@ ensure_projects_root_safe() {
     [[ "$root_real" != "$forbidden" ]] || die "Refusing unsafe Projects root: $root_real"
   done
   [[ -w "$root_real" ]] || die "Projects root is not writable: $root_real"
+}
+
+ensure_projects_root_readable_safe() {
+  local root_real home_real forbidden
+  validate_host_path_string "Projects root" "$PROJECTS_ROOT"
+  [[ -d "$PROJECTS_ROOT" ]] || return 1
+  [[ ! -L "$PROJECTS_ROOT" ]] || return 1
+  root_real="$(realpath -e "$PROJECTS_ROOT" 2>/dev/null)" || return 1
+  home_real="$(realpath -e "$HOME" 2>/dev/null || true)"
+
+  [[ "$root_real" != "/" ]] || return 1
+  if [[ -n "$home_real" ]]; then
+    [[ "$root_real" != "$home_real" ]] || return 1
+  fi
+  for forbidden in /home /root /etc /usr /var /run /mnt /media /dev /proc /sys; do
+    [[ "$root_real" != "$forbidden" ]] || return 1
+  done
+  [[ -r "$root_real" ]] || return 1
 }
 
 project_path_literal() {
@@ -266,6 +285,55 @@ gtk       generic + GTK4/libadwaita/meson/ninja
 android   generic + Java/Gradle/android-tools；Android SDK 仍建议按项目单独补充
 custom    只用基础工具，额外依赖完全写 DNF_PACKAGES
 EOF_PROFILES
+}
+
+profile_names() {
+  printf '%s\n' generic python node rust go gtk android custom
+}
+
+public_commands() {
+  cat <<'EOF_COMMANDS'
+setup
+init
+profiles
+list
+config
+edit
+edit-build-script
+build
+shell
+codex
+enter
+exec
+doctor
+volumes
+reset-cache
+reset-home
+nuke-env
+completion
+EOF_COMMANDS
+}
+
+managed_project_names() {
+  local d name meta cfg nullglob_was_set=0
+  ensure_projects_root_readable_safe || return 0
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -s nullglob
+  for d in "$PROJECTS_ROOT"/*; do
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    name="$(basename "$d")"
+    valid_project_name "$name" || continue
+    meta="$d/.codex-dev"
+    cfg="$meta/project.env"
+    [[ -d "$meta" && ! -L "$meta" ]] || continue
+    [[ -f "$cfg" && ! -L "$cfg" ]] || continue
+    printf '%s\n' "$name"
+  done
+  if [[ "$nullglob_was_set" -eq 1 ]]; then
+    shopt -s nullglob
+  else
+    shopt -u nullglob
+  fi
 }
 
 # Defaults loaded from a project's declarative config.
@@ -547,18 +615,155 @@ list_cmd() {
   need_cmd realpath
   need_cmd sha256sum
   ensure_projects_root_safe
-  local found=0 d name cfg img
-  for d in "$PROJECTS_ROOT"/*; do
-    [[ -d "$d" ]] || continue
-    name="$(basename "$d")"
-    cfg="$d/.codex-dev/project.env"
-    if [[ -f "$cfg" && ! -L "$d/.codex-dev" && ! -L "$cfg" ]]; then
-      img="$(image_name "$name")"
-      printf '%-28s  %-8s  %s\n' "$name" "managed" "$img"
-      found=1
-    fi
-  done
+  local found=0 name img
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    img="$(image_name "$name")"
+    printf '%-28s  %-8s  %s\n' "$name" "managed" "$img"
+    found=1
+  done < <(managed_project_names)
   [[ "$found" -eq 1 ]] || log "No managed projects under $PROJECTS_ROOT"
+}
+
+candidate_matches_prefix() {
+  local candidate="$1" prefix="$2"
+  [[ -z "$prefix" || "$candidate" == "$prefix"* ]]
+}
+
+emit_matching_candidates() {
+  local prefix="$1" candidate
+  shift
+  for candidate in "$@"; do
+    candidate_matches_prefix "$candidate" "$prefix" && printf '%s\n' "$candidate"
+  done
+  return 0
+}
+
+emit_matching_lines() {
+  local prefix="$1" line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    candidate_matches_prefix "$line" "$prefix" && printf '%s\n' "$line"
+  done
+  return 0
+}
+
+word_present_after_project() {
+  local needle="$1" start="$2"
+  local i
+  shift 2
+  local words=("$@")
+  for ((i = start; i < ${#words[@]}; i++)); do
+    [[ "${words[i]}" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+complete_cmd_internal() {
+  local current=""
+  local -a candidates
+  if [[ "${1:-}" != "--current" || $# -lt 3 ]]; then
+    die "Usage: codex-dev __complete --current <1-based-index> -- <words...>"
+  fi
+  shift
+  current="$1"
+  shift
+  [[ "$current" =~ ^[0-9]+$ && "$current" -ge 1 ]] || die "__complete --current must be a 1-based integer"
+  [[ "${1:-}" == "--" ]] || die "Usage: codex-dev __complete --current <1-based-index> -- <words...>"
+  shift
+
+  local words=("$@")
+  local idx=$((current - 1))
+  local cur="${words[idx]:-}"
+  local cmd="${words[1]:-}"
+
+  if [[ "$current" -le 2 ]]; then
+    mapfile -t candidates < <(public_commands)
+    emit_matching_candidates "$cur" "${candidates[@]}"
+    return 0
+  fi
+
+  case "$cmd" in
+    init)
+      if [[ "$current" -eq 4 ]]; then
+        mapfile -t candidates < <(profile_names)
+        emit_matching_candidates "$cur" "${candidates[@]}"
+      fi
+      ;;
+    config|edit|edit-build-script|build|shell|codex|enter|exec|doctor|volumes|reset-cache|reset-home|nuke-env)
+      if [[ "$current" -eq 3 ]]; then
+        managed_project_names | emit_matching_lines "$cur"
+      elif [[ "$cmd" == "shell" && "$current" -ge 4 ]]; then
+        if ! word_present_after_project "--rw-root" 3 "${words[@]}"; then
+          emit_matching_candidates "$cur" "--rw-root"
+        fi
+      elif [[ "$cmd" == "codex" || "$cmd" == "enter" || "$cmd" == "exec" ]]; then
+        if word_present_after_project "--" 3 "${words[@]}"; then
+          return 0
+        fi
+        candidates=()
+        word_present_after_project "--rw-root" 3 "${words[@]}" || candidates+=("--rw-root")
+        candidates+=("--")
+        emit_matching_candidates "$cur" "${candidates[@]}"
+      fi
+      ;;
+    completion)
+      if [[ "$current" -eq 3 ]]; then
+        emit_matching_candidates "$cur" zsh
+      elif [[ "$current" -eq 4 && "${words[2]:-}" == "zsh" ]]; then
+        emit_matching_candidates "$cur" --command
+      fi
+      ;;
+  esac
+}
+
+single_quote_for_zsh() {
+  local s="$1"
+  printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
+completion_zsh() {
+  local cmd_path="$1" quoted
+  quoted="$(single_quote_for_zsh "$cmd_path")"
+  cat <<EOF_ZSH
+#compdef codex-dev
+
+_codex-dev() {
+  local _codex_dev_cmd=$quoted
+  local -a _codex_dev_candidates
+  _codex_dev_candidates=(\${(@f)\$("\$_codex_dev_cmd" __complete --current "\$CURRENT" -- "\${words[@]}" 2>/dev/null)})
+  (( \${#_codex_dev_candidates[@]} )) || return 1
+  compadd -- "\${_codex_dev_candidates[@]}"
+}
+
+_codex-dev "\$@"
+EOF_ZSH
+}
+
+completion_cmd() {
+  local shell="${1:-}" cmd_path
+  [[ -n "$shell" ]] || die "Usage: codex-dev completion zsh [--command <absolute-path>]"
+  shift || true
+  case "$shell" in
+    zsh)
+      if [[ "${1:-}" == "--command" ]]; then
+        [[ $# -eq 2 ]] || die "Usage: codex-dev completion zsh [--command <absolute-path>]"
+        cmd_path="$2"
+        [[ "$cmd_path" == /* ]] || die "--command must be an absolute path"
+      else
+        [[ $# -eq 0 ]] || die "Usage: codex-dev completion zsh [--command <absolute-path>]"
+        cmd_path="$(command -v codex-dev 2>/dev/null || true)"
+        [[ -n "$cmd_path" ]] || cmd_path="codex-dev"
+      fi
+      completion_zsh "$cmd_path"
+      ;;
+    bash|fish)
+      die "$shell completion is not supported yet. Zsh is the only supported completion shell in this release."
+      ;;
+    *)
+      die "Unsupported completion shell '$shell'. Usage: codex-dev completion zsh [--command <absolute-path>]"
+      ;;
+  esac
 }
 
 config_cmd() {
@@ -920,7 +1125,7 @@ main() {
   local cmd="${1:-}"
   shift || true
   case "$cmd" in
-    -h|--help|help|""|profiles) ;;
+    -h|--help|help|""|profiles|completion|__complete) ;;
     *) require_not_root ;;
   esac
   case "$cmd" in
@@ -940,6 +1145,8 @@ main() {
     reset-cache) [[ $# -eq 1 ]] || die "Usage: codex-dev reset-cache <project>"; reset_cache_cmd "$1" ;;
     reset-home) [[ $# -eq 1 ]] || die "Usage: codex-dev reset-home <project>"; reset_home_cmd "$1" ;;
     nuke-env) [[ $# -eq 1 ]] || die "Usage: codex-dev nuke-env <project>"; nuke_env_cmd "$1" ;;
+    completion) completion_cmd "$@" ;;
+    __complete) complete_cmd_internal "$@" ;;
     -h|--help|help|"") usage ;;
     *) usage; die "Unknown command: $cmd" ;;
   esac
