@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP="codex-dev"
-VERSION="0.2.1"
+VERSION="0.2.2-local"
 DEFAULT_FEDORA_IMAGE="registry.fedoraproject.org/fedora:latest"
 CONTAINER_PREFIX="codex-dev"
 
@@ -435,8 +435,6 @@ FROM $CFG_FEDORA_IMAGE
 ARG USER_UID=$uid
 ARG USER_GID=$gid
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 RUN dnf -y update \\
  && dnf -y install $pkgs \\
  && dnf clean all \\
@@ -444,13 +442,12 @@ RUN dnf -y update \\
 
 $hook_snippet
 
-RUN mkdir -p /home/codex /workspace $CODEX_INSTALL_CACHE $CODEX_INSTALL_DIR \\
+RUN mkdir -p /home/codex /home/codex/.codex /home/codex/.cache /home/codex/.npm /home/codex/.cargo /home/codex/.gradle /home/codex/go /home/codex/.local/bin /workspace $CODEX_INSTALL_CACHE $CODEX_INSTALL_DIR \\
  && if ! getent group "\${USER_GID}" >/dev/null; then groupadd -g "\${USER_GID}" codex; fi \\
  && if ! getent passwd "\${USER_UID}" >/dev/null; then useradd -m -u "\${USER_UID}" -g "\${USER_GID}" -s /bin/bash codex; fi \\
  && chown -R "\${USER_UID}:\${USER_GID}" /home/codex /workspace
 
-RUN curl -fsSL https://chatgpt.com/codex/install.sh \\
- | CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=$CODEX_INSTALL_DIR CODEX_HOME=$CODEX_INSTALL_CACHE sh \\
+RUN /bin/bash -o pipefail -c 'curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=$CODEX_INSTALL_DIR CODEX_HOME=$CODEX_INSTALL_CACHE sh' \\
  && chmod -R a+rX $CODEX_INSTALL_CACHE $CODEX_INSTALL_DIR \\
  && command -v codex \\
  && codex --version
@@ -728,7 +725,13 @@ run_container() {
   log "Host home, ~/Projects parent, SSH keys, config dirs, Podman socket, host namespaces, and devices are not mounted."
   local rc
   set +e
-  podman run "${CONTAINER_ARGS[@]}" "$img" "$@"
+  podman run "${CONTAINER_ARGS[@]}" "$img" /bin/bash -lc '
+    set -Eeuo pipefail
+    umask 077
+    mkdir -p "$HOME" "$CODEX_HOME" "$HOME/.cache" "$HOME/.npm" "$HOME/.cargo" "$HOME/.gradle" "$HOME/go" "$HOME/.local/bin"
+    chmod 700 "$HOME" "$CODEX_HOME" 2>/dev/null || true
+    exec "$@"
+  ' codex-dev-runtime-init "$@"
   rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
