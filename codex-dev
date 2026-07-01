@@ -1,0 +1,945 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP="codex-dev"
+VERSION="0.2.1"
+DEFAULT_FEDORA_IMAGE="registry.fedoraproject.org/fedora:latest"
+CONTAINER_PREFIX="codex-dev"
+
+expand_leading_tilde() {
+  local p="$1"
+  case "$p" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${p#~/}" ;;
+    *) printf '%s' "$p" ;;
+  esac
+}
+
+PROJECTS_ROOT="$(expand_leading_tilde "${CODEX_DEV_PROJECTS_ROOT:-$HOME/Projects}")"
+CONFIG_HOME="$(expand_leading_tilde "${XDG_CONFIG_HOME:-$HOME/.config}")"
+CONFIG_DIR="$(expand_leading_tilde "${CODEX_DEV_CONFIG_DIR:-$CONFIG_HOME/codex-dev}")"
+BUILD_ROOT="$CONFIG_DIR/build"
+IMAGE_PREFIX="${CODEX_DEV_IMAGE_PREFIX:-localhost/codex-dev}"
+
+# The visible codex command is installed into the image here.
+CODEX_INSTALL_DIR="/usr/local/bin"
+CODEX_INSTALL_CACHE="/opt/codex-standalone"
+
+log() { printf '[%s] %s\n' "$APP" "$*" >&2; }
+warn() { printf '[%s] WARNING: %s\n' "$APP" "$*" >&2; }
+die() { printf '[%s] ERROR: %s\n' "$APP" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<USAGE
+codex-dev $VERSION
+
+Usage:
+  codex-dev setup
+  codex-dev init <project> [profile]
+  codex-dev profiles
+  codex-dev list
+  codex-dev config <project>
+  codex-dev edit <project>
+  codex-dev edit-build-script <project>
+  codex-dev build <project>
+  codex-dev shell <project> [--rw-root]
+  codex-dev codex <project> [--rw-root] [-- <extra codex args...>]
+  codex-dev enter <project> [--rw-root] [-- <extra codex args...>]
+  codex-dev exec <project> [--rw-root] -- <prompt>
+  codex-dev doctor [project]
+  codex-dev volumes <project>
+  codex-dev reset-cache <project>
+  codex-dev reset-home <project>
+  codex-dev nuke-env <project>
+
+Environment overrides:
+  CODEX_DEV_PROJECTS_ROOT   default: ~/Projects
+  CODEX_DEV_CONFIG_DIR      default: ~/.config/codex-dev
+  CODEX_DEV_IMAGE_PREFIX    default: localhost/codex-dev
+USAGE
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+require_not_root() {
+  [[ "$(id -u)" != "0" ]] || die "Do not run codex-dev as root. Use rootless Podman as your normal Fedora user."
+}
+
+trim() {
+  local s="$*"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+strip_inline_comment() {
+  local s="$1" out="" quote="" ch prev=""
+  local i
+  for ((i = 0; i < ${#s}; i++)); do
+    ch="${s:i:1}"
+    if [[ -z "$quote" && "$ch" == "#" ]]; then
+      break
+    fi
+    if [[ "$ch" == "'" && "$quote" != '"' ]]; then
+      if [[ "$quote" == "'" ]]; then quote=""; else quote="'"; fi
+    elif [[ "$ch" == '"' && "$quote" != "'" && "$prev" != "\\" ]]; then
+      if [[ "$quote" == '"' ]]; then quote=""; else quote='"'; fi
+    fi
+    out+="$ch"
+    prev="$ch"
+  done
+  printf '%s' "$out"
+}
+
+strip_outer_quotes_or_die() {
+  local val="$1" cfg="$2" lineno="$3"
+  if [[ "${val:0:1}" == '"' ]]; then
+    [[ ${#val} -ge 2 && "${val: -1}" == '"' ]] || die "Unmatched double quote in $cfg:$lineno"
+    val="${val:1:${#val}-2}"
+  elif [[ "${val:0:1}" == "'" ]]; then
+    [[ ${#val} -ge 2 && "${val: -1}" == "'" ]] || die "Unmatched single quote in $cfg:$lineno"
+    val="${val:1:${#val}-2}"
+  fi
+  printf '%s' "$val"
+}
+
+valid_project_name() {
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  [[ "$name" != *".."* ]] || return 1
+  [[ "$name" != "." && "$name" != ".." ]] || return 1
+}
+
+require_project_name() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Project name is required."
+  valid_project_name "$name" || die "Invalid project name '$name'. Use letters, digits, dot, underscore, hyphen; no slash or '..'."
+}
+
+validate_host_path_string() {
+  local label="$1" path="$2"
+  [[ -n "$path" ]] || die "$label must not be empty."
+  [[ "$path" == /* ]] || die "$label must be an absolute path. Do not use a literal '~' in environment variables; use an expanded absolute path."
+  [[ "$path" != *":"* ]] || die "$label must not contain ':', because Podman volume syntax uses ':'. Got: $path"
+  [[ "$path" != *$'\n'* && "$path" != *$'\r'* ]] || die "$label must not contain newline characters."
+}
+
+validate_image_prefix() {
+  [[ -n "$IMAGE_PREFIX" ]] || die "CODEX_DEV_IMAGE_PREFIX must not be empty."
+  [[ "$IMAGE_PREFIX" != -* ]] || die "CODEX_DEV_IMAGE_PREFIX must not start with '-'."
+  [[ "$IMAGE_PREFIX" != *[[:space:]]* ]] || die "CODEX_DEV_IMAGE_PREFIX must not contain whitespace."
+  [[ "$IMAGE_PREFIX" =~ ^[A-Za-z0-9._:/-]+$ ]] || die "CODEX_DEV_IMAGE_PREFIX contains unsupported characters: $IMAGE_PREFIX"
+}
+
+ensure_setup_dirs() {
+  validate_host_path_string "Projects root" "$PROJECTS_ROOT"
+  mkdir -p "$CONFIG_DIR" "$BUILD_ROOT" "$PROJECTS_ROOT" || die "Failed to create config/build/projects directories."
+}
+
+ensure_projects_root_safe() {
+  local root_real home_real forbidden
+  validate_host_path_string "Projects root" "$PROJECTS_ROOT"
+  [[ -d "$PROJECTS_ROOT" ]] || die "Projects root does not exist: $PROJECTS_ROOT"
+  [[ ! -L "$PROJECTS_ROOT" ]] || die "Projects root must not be a symlink: $PROJECTS_ROOT"
+  root_real="$(realpath -e "$PROJECTS_ROOT")" || die "Cannot resolve Projects root: $PROJECTS_ROOT"
+  home_real="$(realpath -e "$HOME")" || die "Cannot resolve HOME: $HOME"
+
+  [[ "$root_real" != "/" ]] || die "Refusing to use / as Projects root."
+  [[ "$root_real" != "$home_real" ]] || die "Refusing to use HOME itself as Projects root: $root_real"
+  for forbidden in /home /root /etc /usr /var /run /mnt /media /dev /proc /sys; do
+    [[ "$root_real" != "$forbidden" ]] || die "Refusing unsafe Projects root: $root_real"
+  done
+  [[ -w "$root_real" ]] || die "Projects root is not writable: $root_real"
+}
+
+project_path_literal() {
+  local name="$1"
+  printf '%s/%s' "$PROJECTS_ROOT" "$name"
+}
+
+project_path_real() {
+  local name="$1"
+  local p root_real real
+  p="$(project_path_literal "$name")"
+  [[ -d "$p" ]] || die "Project directory does not exist: $p"
+  [[ ! -L "$p" ]] || die "Project directory must not be a symlink: $p"
+  root_real="$(realpath -e "$PROJECTS_ROOT")"
+  real="$(realpath -e "$p")"
+  [[ "$real" == "$root_real/"* ]] || die "Project escaped Projects root: $real"
+  [[ "$real" != "$root_real" ]] || die "Refusing to use Projects root itself as a project."
+  validate_host_path_string "Project real path" "$real"
+  printf '%s' "$real"
+}
+
+project_meta_dir() {
+  local name="$1"
+  printf '%s/.codex-dev' "$(project_path_literal "$name")"
+}
+
+project_config_path() {
+  local name="$1"
+  printf '%s/project.env' "$(project_meta_dir "$name")"
+}
+
+ensure_project_meta_safe() {
+  local name="$1" meta
+  meta="$(project_meta_dir "$name")"
+  [[ -d "$meta" ]] || die "Project metadata directory missing: $meta. Run: codex-dev init $name"
+  [[ ! -L "$meta" ]] || die "Project metadata directory must not be a symlink: $meta"
+}
+
+safe_slug() {
+  local s="$1"
+  s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[._-]+//; s/[._-]+$//')"
+  [[ -n "$s" ]] || s="project"
+  printf '%s' "$s"
+}
+
+resource_id() {
+  local name="$1" slug hash
+  slug="$(safe_slug "$name")"
+  hash="$(printf '%s' "$name" | sha256sum | awk '{print substr($1,1,10)}')"
+  printf '%s-%s' "$slug" "$hash"
+}
+
+profile_packages() {
+  local profile="$1"
+  case "$profile" in
+    generic)
+      cat <<'PKGS'
+PKGS
+      ;;
+    python)
+      cat <<'PKGS'
+python3 python3-pip python3-devel python3-virtualenv pipx
+PKGS
+      ;;
+    node)
+      cat <<'PKGS'
+nodejs npm
+PKGS
+      ;;
+    rust)
+      cat <<'PKGS'
+rust cargo rustfmt
+PKGS
+      ;;
+    go)
+      cat <<'PKGS'
+golang
+PKGS
+      ;;
+    gtk)
+      cat <<'PKGS'
+python3 python3-pip meson ninja-build pkgconf-pkg-config gtk4-devel libadwaita-devel blueprint-compiler gettext desktop-file-utils
+PKGS
+      ;;
+    android)
+      cat <<'PKGS'
+java-21-openjdk-devel gradle android-tools cmake ninja-build clang zip unzip
+PKGS
+      ;;
+    custom)
+      cat <<'PKGS'
+PKGS
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+profile_exists() {
+  profile_packages "$1" >/dev/null 2>&1
+}
+
+print_profiles() {
+  cat <<'EOF_PROFILES'
+generic   基础开发工具 + Codex CLI
+python    generic + Python/pip/venv/pipx
+node      generic + Node.js/npm
+rust      generic + Rust/Cargo
+go        generic + Go
+gtk       generic + GTK4/libadwaita/meson/ninja
+android   generic + Java/Gradle/android-tools；Android SDK 仍建议按项目单独补充
+custom    只用基础工具，额外依赖完全写 DNF_PACKAGES
+EOF_PROFILES
+}
+
+# Defaults loaded from a project's declarative config.
+CFG_PROFILE="generic"
+CFG_FEDORA_IMAGE="$DEFAULT_FEDORA_IMAGE"
+CFG_DNF_PACKAGES=""
+CFG_READ_ONLY_ROOT="yes"
+CFG_BUILD_SCRIPT=""
+
+validate_fedora_image() {
+  local img="$1"
+  [[ -n "$img" ]] || die "FEDORA_IMAGE must not be empty."
+  [[ "$img" != -* ]] || die "FEDORA_IMAGE must not start with '-'."
+  [[ "$img" != *[[:space:]]* ]] || die "FEDORA_IMAGE must not contain whitespace."
+  case "$img" in
+    fedora|fedora:*|registry.fedoraproject.org/fedora|registry.fedoraproject.org/fedora:*) ;;
+    *) die "FEDORA_IMAGE must be a Fedora image such as registry.fedoraproject.org/fedora:latest" ;;
+  esac
+  [[ "$img" =~ ^[A-Za-z0-9._:/-]+$ ]] || die "FEDORA_IMAGE contains unsupported characters: $img"
+}
+
+validate_package_tokens() {
+  local list="$1" token
+  for token in $list; do
+    [[ "$token" =~ ^[A-Za-z0-9._+:@-]+$ ]] || die "Unsafe DNF package token: $token"
+    [[ "$token" != -* ]] || die "DNF package token must not start with '-': $token"
+  done
+}
+
+validate_build_script_path() {
+  local rel="$1"
+  local IFS='/' part
+  local -a parts
+  [[ -z "$rel" ]] && return 0
+  [[ "$rel" != /* ]] || die "BUILD_SCRIPT must be a relative path inside .codex-dev, not an absolute path."
+  [[ "$rel" == .codex-dev/* ]] || die "BUILD_SCRIPT must point inside .codex-dev/, for example .codex-dev/build.sh"
+  [[ "$rel" != *[[:space:]]* ]] || die "BUILD_SCRIPT path must not contain whitespace: $rel"
+  [[ "$rel" != *":"* ]] || die "BUILD_SCRIPT path must not contain ':': $rel"
+  read -r -a parts <<< "$rel"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != "." && "$part" != ".." ]] || die "BUILD_SCRIPT contains an unsafe path component: $rel"
+  done
+}
+load_project_config() {
+  local name="$1" cfg line raw key val lineno
+  project_path_real "$name" >/dev/null
+  ensure_project_meta_safe "$name"
+  cfg="$(project_config_path "$name")"
+  [[ -f "$cfg" ]] || die "Project config missing: $cfg. Run: codex-dev init $name"
+  [[ ! -L "$cfg" ]] || die "Project config must not be a symlink: $cfg"
+
+  CFG_PROFILE="generic"
+  CFG_FEDORA_IMAGE="$DEFAULT_FEDORA_IMAGE"
+  CFG_DNF_PACKAGES=""
+  CFG_READ_ONLY_ROOT="yes"
+  CFG_BUILD_SCRIPT=""
+
+  lineno=0
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    lineno=$((lineno + 1))
+    [[ "$raw" != *$'\r'* ]] || die "Invalid CR character in $cfg:$lineno. Use Unix line endings."
+    line="$(strip_inline_comment "$raw")"
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || die "Invalid config line in $cfg:$lineno: $raw"
+    key="${BASH_REMATCH[1]}"
+    val="$(trim "${BASH_REMATCH[2]}")"
+    val="$(strip_outer_quotes_or_die "$val" "$cfg" "$lineno")"
+    case "$key" in
+      PROFILE) CFG_PROFILE="$val" ;;
+      FEDORA_IMAGE) CFG_FEDORA_IMAGE="$val" ;;
+      DNF_PACKAGES) CFG_DNF_PACKAGES="$val" ;;
+      READ_ONLY_ROOT) CFG_READ_ONLY_ROOT="$val" ;;
+      BUILD_SCRIPT) CFG_BUILD_SCRIPT="$val" ;;
+      *) die "Unsupported config key '$key' in $cfg:$lineno. This manager intentionally rejects arbitrary container args." ;;
+    esac
+  done < "$cfg"
+
+  profile_exists "$CFG_PROFILE" || die "Unknown PROFILE '$CFG_PROFILE'. Run: codex-dev profiles"
+  validate_fedora_image "$CFG_FEDORA_IMAGE"
+  validate_package_tokens "$CFG_DNF_PACKAGES"
+  case "$CFG_READ_ONLY_ROOT" in
+    yes|no) ;;
+    *) die "READ_ONLY_ROOT must be yes or no" ;;
+  esac
+  validate_build_script_path "$CFG_BUILD_SCRIPT"
+}
+
+resolve_build_script_or_empty() {
+  local name="$1" rel="$2" project_real script_real meta_real script_path
+  [[ -z "$rel" ]] && return 0
+  project_real="$(project_path_real "$name")"
+  script_path="$project_real/$rel"
+  [[ -f "$script_path" ]] || die "BUILD_SCRIPT does not exist or is not a regular file: $script_path"
+  [[ ! -L "$script_path" ]] || die "BUILD_SCRIPT must not be a symlink: $script_path"
+  script_real="$(realpath -e "$script_path")"
+  meta_real="$(realpath -e "$project_real/.codex-dev")"
+  [[ "$script_real" == "$meta_real/"* ]] || die "BUILD_SCRIPT escaped .codex-dev: $script_real"
+  printf '%s' "$script_real"
+}
+
+base_packages() {
+  cat <<'PKGS'
+ca-certificates curl git openssh-clients rsync bash bash-completion coreutils findutils diffutils grep sed gawk tar gzip xz unzip zip bzip2 patch procps-ng util-linux which hostname iproute iputils less nano vim-minimal jq file glibc-langpack-en make gcc gcc-c++ shadow-utils
+PKGS
+}
+
+unique_words() {
+  tr '[:space:]' '\n' | awk 'NF && !seen[$0]++ { print }' | tr '\n' ' '
+}
+
+image_name() {
+  local name="$1"
+  printf '%s/%s:latest' "$IMAGE_PREFIX" "$(resource_id "$name")"
+}
+
+container_name() {
+  local name="$1"
+  printf '%s-%s' "$CONTAINER_PREFIX" "$(resource_id "$name")"
+}
+
+volume_name() {
+  local kind="$1" name="$2"
+  printf '%s-%s-%s' "$CONTAINER_PREFIX" "$kind" "$(resource_id "$name")"
+}
+
+check_project_tree_safety() {
+  local name="$1" real hit nested
+  real="$(project_path_real "$name")"
+  hit="$(find "$real" -xdev \( -type s -o -type p -o -type b -o -type c \) -print -quit 2>/dev/null || true)"
+  [[ -z "$hit" ]] || die "Refusing project containing socket/FIFO/device file: $hit. Such files can expose host services into /workspace."
+  if command -v findmnt >/dev/null 2>&1; then
+    nested="$(findmnt -R -n -r -o TARGET 2>/dev/null | awk -v root="$real" '($0 != root) && index($0, root "/") == 1 { print; exit }')"
+    [[ -z "$nested" ]] || die "Refusing project containing nested mount point: $nested. It can expose additional host paths."
+  fi
+  if [[ "${CODEX_DEV_ALLOW_HARDLINKS:-0}" != "1" ]]; then
+    hit="$(find "$real" -xdev -type f -links +1 -print -quit 2>/dev/null || true)"
+    [[ -z "$hit" ]] || die "Refusing project with hardlinked files: $hit. Hardlinks can share an inode with files outside /workspace. Replace hardlinks with copies, or set CODEX_DEV_ALLOW_HARDLINKS=1 only after auditing."
+  fi
+}
+
+generate_containerfile() {
+  local name="$1" dir pkgs profile_pkgs uid gid script_real hook_snippet
+  load_project_config "$name"
+  validate_image_prefix
+  dir="$BUILD_ROOT/$(resource_id "$name")"
+  mkdir -p "$dir" || die "Failed to create build directory: $dir"
+  rm -f "$dir/Containerfile" "$dir/project-build.sh"
+  uid="$(id -u)"
+  gid="$(id -g)"
+  profile_pkgs="$(profile_packages "$CFG_PROFILE")"
+  pkgs="$(printf '%s %s %s\n' "$(base_packages)" "$profile_pkgs" "$CFG_DNF_PACKAGES" | unique_words)"
+
+  hook_snippet=""
+  script_real="$(resolve_build_script_or_empty "$name" "$CFG_BUILD_SCRIPT")"
+  if [[ -n "$script_real" ]]; then
+    cp "$script_real" "$dir/project-build.sh" || die "Failed to copy BUILD_SCRIPT into build context."
+    chmod 0644 "$dir/project-build.sh" || die "Failed to set permissions on copied BUILD_SCRIPT."
+    hook_snippet=$'COPY project-build.sh /tmp/codex-dev-project-build.sh\nRUN chmod 0755 /tmp/codex-dev-project-build.sh \\\n && /bin/bash /tmp/codex-dev-project-build.sh \\\n && rm -f /tmp/codex-dev-project-build.sh'
+  fi
+
+  cat > "$dir/Containerfile" <<EOF_CONTAINERFILE
+# Generated by codex-dev. Do not edit this file directly.
+# Edit $(project_config_path "$name") and run: codex-dev build $name
+FROM $CFG_FEDORA_IMAGE
+
+ARG USER_UID=$uid
+ARG USER_GID=$gid
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN dnf -y update \\
+ && dnf -y install $pkgs \\
+ && dnf clean all \\
+ && rm -rf /var/cache/dnf
+
+$hook_snippet
+
+RUN mkdir -p /home/codex /workspace $CODEX_INSTALL_CACHE $CODEX_INSTALL_DIR \\
+ && if ! getent group "\${USER_GID}" >/dev/null; then groupadd -g "\${USER_GID}" codex; fi \\
+ && if ! getent passwd "\${USER_UID}" >/dev/null; then useradd -m -u "\${USER_UID}" -g "\${USER_GID}" -s /bin/bash codex; fi \\
+ && chown -R "\${USER_UID}:\${USER_GID}" /home/codex /workspace
+
+RUN curl -fsSL https://chatgpt.com/codex/install.sh \\
+ | CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=$CODEX_INSTALL_DIR CODEX_HOME=$CODEX_INSTALL_CACHE sh \\
+ && chmod -R a+rX $CODEX_INSTALL_CACHE $CODEX_INSTALL_DIR \\
+ && command -v codex \\
+ && codex --version
+
+ENV HOME=/home/codex
+ENV USER=codex
+ENV SHELL=/bin/bash
+ENV CODEX_HOME=/home/codex/.codex
+ENV PATH=/home/codex/.local/bin:$CODEX_INSTALL_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+WORKDIR /workspace
+USER $uid:$gid
+EOF_CONTAINERFILE
+
+  printf '%s' "$dir/Containerfile"
+}
+
+podman_rootless_value() {
+  podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true
+}
+
+ensure_podman_rootless() {
+  local rootless
+  need_cmd podman
+  rootless="$(podman_rootless_value)"
+  [[ "$rootless" == "true" ]] || die "Could not confirm rootless Podman. podman info reported Rootless='${rootless:-unknown}'. Do not run this through sudo/rootful Podman."
+}
+
+setup_cmd() {
+  ensure_setup_dirs
+  ensure_podman_rootless
+  need_cmd realpath
+  need_cmd sha256sum
+  need_cmd find
+  ensure_projects_root_safe
+  validate_image_prefix
+  if [[ ":${PATH}:" != *":$HOME/.local/bin:"* ]]; then
+    warn "Add ~/.local/bin to PATH if codex-dev is not found after install."
+  fi
+  log "Config dir: $CONFIG_DIR"
+  log "Projects root: $PROJECTS_ROOT"
+  log "OK"
+}
+
+init_cmd() {
+  local name profile p cfg meta
+  name="${1:-}"
+  profile="${2:-generic}"
+  [[ $# -le 2 ]] || die "Usage: codex-dev init <project> [profile]"
+  require_project_name "$name"
+  profile_exists "$profile" || die "Unknown profile '$profile'. Run: codex-dev profiles"
+  ensure_setup_dirs
+  need_cmd realpath
+  need_cmd sha256sum
+  ensure_projects_root_safe
+  p="$(project_path_literal "$name")"
+  meta="$p/.codex-dev"
+  [[ "$p" != "$PROJECTS_ROOT" ]] || die "Refusing Projects root."
+  [[ ! -L "$p" ]] || die "Project path must not be a symlink: $p"
+  [[ ! -e "$p" || -d "$p" ]] || die "Project path exists but is not a directory: $p"
+  if [[ -e "$meta" ]]; then
+    [[ -d "$meta" && ! -L "$meta" ]] || die "Project metadata path exists but is unsafe: $meta"
+  fi
+  mkdir -p "$meta" || die "Failed to create project metadata directory: $meta"
+  cfg="$(project_config_path "$name")"
+  [[ ! -L "$cfg" ]] || die "Project config must not be a symlink: $cfg"
+  if [[ ! -f "$cfg" ]]; then
+    cat > "$cfg" <<EOF_CFG
+# codex-dev project environment
+# This file is declarative. It cannot add mounts, host namespaces, privileged mode, sockets, or devices.
+# Syntax: KEY=VALUE, one assignment per line. This is not a shell script.
+
+PROFILE=$profile
+FEDORA_IMAGE=$DEFAULT_FEDORA_IMAGE
+READ_ONLY_ROOT=yes
+
+# Add Fedora packages here. Package names only; shell syntax is intentionally rejected.
+# Examples:
+# DNF_PACKAGES="python3-pip nodejs npm cmake ninja-build openssl-devel"
+DNF_PACKAGES=""
+
+# Optional build hook. To run build-time commands, create .codex-dev/build.sh and set:
+# BUILD_SCRIPT=".codex-dev/build.sh"
+BUILD_SCRIPT=""
+EOF_CFG
+  fi
+  if command -v git >/dev/null 2>&1 && [[ ! -d "$p/.git" ]]; then
+    (cd "$p" && git init -q) || warn "Git init skipped or failed."
+  fi
+  log "Project created: $p"
+  log "Config: $cfg"
+  log "Next: codex-dev build $name"
+}
+
+list_cmd() {
+  ensure_setup_dirs
+  need_cmd realpath
+  need_cmd sha256sum
+  ensure_projects_root_safe
+  local found=0 d name cfg img
+  for d in "$PROJECTS_ROOT"/*; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    cfg="$d/.codex-dev/project.env"
+    if [[ -f "$cfg" && ! -L "$d/.codex-dev" && ! -L "$cfg" ]]; then
+      img="$(image_name "$name")"
+      printf '%-28s  %-8s  %s\n' "$name" "managed" "$img"
+      found=1
+    fi
+  done
+  [[ "$found" -eq 1 ]] || log "No managed projects under $PROJECTS_ROOT"
+}
+
+config_cmd() {
+  local name="$1"
+  require_project_name "$name"
+  project_path_real "$name" >/dev/null
+  ensure_project_meta_safe "$name"
+  local cfg
+  cfg="$(project_config_path "$name")"
+  [[ -f "$cfg" ]] || die "Project config missing: $cfg"
+  [[ ! -L "$cfg" ]] || die "Project config must not be a symlink: $cfg"
+  printf '%s\n' "$cfg"
+}
+
+edit_cmd() {
+  local name="$1" editor cfg
+  require_project_name "$name"
+  project_path_real "$name" >/dev/null
+  ensure_project_meta_safe "$name"
+  cfg="$(project_config_path "$name")"
+  [[ -f "$cfg" ]] || die "Project config missing: $cfg"
+  [[ ! -L "$cfg" ]] || die "Project config must not be a symlink: $cfg"
+  editor="${EDITOR:-nano}"
+  command -v "$editor" >/dev/null 2>&1 || die "Editor not found: $editor. Set EDITOR or install nano/vim."
+  "$editor" "$cfg"
+}
+
+edit_build_script_cmd() {
+  local name="$1" editor script
+  require_project_name "$name"
+  project_path_real "$name" >/dev/null
+  ensure_project_meta_safe "$name"
+  script="$(project_path_literal "$name")/.codex-dev/build.sh"
+  [[ ! -L "$script" ]] || die "Build script must not be a symlink: $script"
+  if [[ ! -f "$script" ]]; then
+    cat > "$script" <<'EOF_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Build-time commands run inside the image build container as root.
+# They do not get host mounts, Podman/Docker sockets, or your host HOME.
+# Example:
+# dnf -y install ffmpeg portaudio-devel && dnf clean all
+EOF_SCRIPT
+    chmod 0755 "$script" || die "Failed to chmod build script: $script"
+    log "Created: $script"
+    log "Enable it in project.env with: BUILD_SCRIPT=\".codex-dev/build.sh\""
+  fi
+  editor="${EDITOR:-nano}"
+  command -v "$editor" >/dev/null 2>&1 || die "Editor not found: $editor. Set EDITOR or install nano/vim."
+  "$editor" "$script"
+}
+
+build_cmd() {
+  local name="$1" cf img
+  require_project_name "$name"
+  ensure_setup_dirs
+  ensure_podman_rootless
+  need_cmd realpath
+  need_cmd sha256sum
+  need_cmd find
+  ensure_projects_root_safe
+  check_project_tree_safety "$name"
+  cf="$(generate_containerfile "$name")"
+  img="$(image_name "$name")"
+  log "Building image: $img"
+  log "Containerfile: $cf"
+  podman build --pull=newer -t "$img" -f "$cf" "$(dirname "$cf")" || die "podman build failed for project '$name'. Check project.env, DNF_PACKAGES, BUILD_SCRIPT, and network access."
+}
+
+declare -a CONTAINER_ARGS=()
+
+container_base_args() {
+  local name="$1" rw_root="$2" project_real home_vol cache_vol npm_vol cargo_vol gradle_vol go_vol
+  project_real="$(project_path_real "$name")"
+  home_vol="$(volume_name home "$name")"
+  cache_vol="$(volume_name cache "$name")"
+  npm_vol="$(volume_name npm "$name")"
+  cargo_vol="$(volume_name cargo "$name")"
+  gradle_vol="$(volume_name gradle "$name")"
+  go_vol="$(volume_name go "$name")"
+
+  CONTAINER_ARGS=(
+    --rm
+    --interactive
+    --tty
+    --name "$(container_name "$name")"
+    --hostname "$(container_name "$name")"
+    --userns=keep-id
+    --user "$(id -u):$(id -g)"
+    --workdir /workspace
+    --env HOME=/home/codex
+    --env USER=codex
+    --env SHELL=/bin/bash
+    --env CODEX_HOME=/home/codex/.codex
+    --security-opt no-new-privileges
+    --cap-drop ALL
+    --pids-limit 4096
+    --tmpfs /tmp:rw,nosuid,nodev,exec,size=2g
+    --tmpfs /run:rw,nosuid,nodev,noexec,size=128m
+    --tmpfs /var/tmp:rw,nosuid,nodev,exec,size=2g
+    --volume "$project_real:/workspace:Z,rw"
+    --volume "$home_vol:/home/codex:Z,U"
+    --volume "$cache_vol:/home/codex/.cache:Z,U"
+    --volume "$npm_vol:/home/codex/.npm:Z,U"
+    --volume "$cargo_vol:/home/codex/.cargo:Z,U"
+    --volume "$gradle_vol:/home/codex/.gradle:Z,U"
+    --volume "$go_vol:/home/codex/go:Z,U"
+  )
+
+  if [[ "$rw_root" != "yes" ]]; then
+    CONTAINER_ARGS+=(--read-only)
+  fi
+}
+
+ensure_container_slot() {
+  local name="$1" cname state
+  cname="$(container_name "$name")"
+  if podman container exists "$cname"; then
+    state="$(podman inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || printf 'unknown')"
+    case "$state" in
+      running|paused)
+        die "Container '$cname' is already $state. Exit it first, or remove it with: podman rm -f $cname"
+        ;;
+      *)
+        warn "Removing stale container '$cname' with state '$state'."
+        podman rm -f "$cname" >/dev/null || die "Failed to remove stale container: $cname"
+        ;;
+    esac
+  fi
+}
+
+run_container() {
+  local name="$1" rw_root_requested="$2" img effective_rw_root
+  shift 2
+  require_project_name "$name"
+  ensure_setup_dirs
+  ensure_podman_rootless
+  need_cmd realpath
+  need_cmd sha256sum
+  need_cmd find
+  ensure_projects_root_safe
+  load_project_config "$name"
+  check_project_tree_safety "$name"
+  validate_image_prefix
+  img="$(image_name "$name")"
+  if ! podman image exists "$img"; then
+    log "Image missing. Building first: $img"
+    build_cmd "$name"
+  fi
+  case "$rw_root_requested" in
+    auto)
+      if [[ "$CFG_READ_ONLY_ROOT" == "yes" ]]; then effective_rw_root="no"; else effective_rw_root="yes"; fi
+      ;;
+    yes|no)
+      effective_rw_root="$rw_root_requested"
+      ;;
+    *) die "Internal error: invalid rw_root value: $rw_root_requested" ;;
+  esac
+  ensure_container_slot "$name"
+  container_base_args "$name" "$effective_rw_root"
+  log "Project mount: $(project_path_real "$name") -> /workspace"
+  log "Root filesystem writable: $effective_rw_root"
+  log "Host home, ~/Projects parent, SSH keys, config dirs, Podman socket, host namespaces, and devices are not mounted."
+  local rc
+  set +e
+  podman run "${CONTAINER_ARGS[@]}" "$img" "$@"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "podman run exited with status $rc."
+  fi
+  return "$rc"
+}
+
+parse_rw_flag() {
+  RW_ROOT="auto"
+  if [[ "${1:-}" == "--rw-root" ]]; then
+    RW_ROOT="yes"
+    shift
+  fi
+  REMAINING_ARGS=("$@")
+}
+
+shell_cmd() {
+  local name="$1"; shift || true
+  parse_rw_flag "$@"
+  [[ "${#REMAINING_ARGS[@]}" -eq 0 ]] || die "codex-dev shell only accepts --rw-root after the project name."
+  run_container "$name" "$RW_ROOT" /bin/bash -l
+}
+
+codex_cmd() {
+  local name="$1"; shift || true
+  parse_rw_flag "$@"
+  local extra=("${REMAINING_ARGS[@]}")
+  if [[ "${extra[0]:-}" == "--" ]]; then
+    extra=("${extra[@]:1}")
+  fi
+  run_container "$name" "$RW_ROOT" codex --cd /workspace --sandbox danger-full-access --ask-for-approval never "${extra[@]}"
+}
+
+exec_cmd() {
+  local name="$1"; shift || true
+  parse_rw_flag "$@"
+  local prompt_args=("${REMAINING_ARGS[@]}")
+  if [[ "${prompt_args[0]:-}" == "--" ]]; then
+    prompt_args=("${prompt_args[@]:1}")
+  fi
+  [[ "${#prompt_args[@]}" -gt 0 ]] || die "Provide a prompt after --"
+  run_container "$name" "$RW_ROOT" codex exec --cd /workspace --sandbox danger-full-access --ask-for-approval never "${prompt_args[*]}"
+}
+
+volumes_cmd() {
+  local name="$1" kind
+  require_project_name "$name"
+  need_cmd sha256sum
+  for kind in home cache npm cargo gradle go; do
+    printf '%-8s %s\n' "$kind" "$(volume_name "$kind" "$name")"
+  done
+}
+
+remove_volume_if_exists() {
+  local vol="$1"
+  if podman volume exists "$vol"; then
+    podman volume rm "$vol" >/dev/null || die "Failed to remove volume '$vol'. A container may still be using it."
+    log "Removed volume: $vol"
+  else
+    log "Volume not present: $vol"
+  fi
+}
+
+reset_cache_cmd() {
+  local name="$1" kind vol
+  require_project_name "$name"
+  ensure_podman_rootless
+  need_cmd sha256sum
+  for kind in cache npm cargo gradle go; do
+    vol="$(volume_name "$kind" "$name")"
+    remove_volume_if_exists "$vol"
+  done
+}
+
+reset_home_cmd() {
+  local name="$1" vol
+  require_project_name "$name"
+  ensure_podman_rootless
+  need_cmd sha256sum
+  vol="$(volume_name home "$name")"
+  remove_volume_if_exists "$vol"
+  log "Codex login/config for this project was removed if that volume existed. Project files were not touched."
+}
+
+nuke_env_cmd() {
+  local name="$1" img kind vol cname
+  require_project_name "$name"
+  ensure_podman_rootless
+  need_cmd sha256sum
+  validate_image_prefix
+  img="$(image_name "$name")"
+  cname="$(container_name "$name")"
+  if podman container exists "$cname"; then
+    podman rm -f "$cname" >/dev/null || die "Failed to remove container: $cname"
+    log "Removed container: $cname"
+  else
+    log "Container not present: $cname"
+  fi
+  if podman image exists "$img"; then
+    podman image rm -f "$img" >/dev/null || die "Failed to remove image: $img"
+    log "Removed image: $img"
+  else
+    log "Image not present: $img"
+  fi
+  for kind in home cache npm cargo gradle go; do
+    vol="$(volume_name "$kind" "$name")"
+    remove_volume_if_exists "$vol"
+  done
+  log "Project directory was not touched: $(project_path_literal "$name")"
+}
+
+doctor_cmd() {
+  local name="${1:-}" rootless info img real cfg cname status kind vol effective_ro
+  [[ $# -le 1 ]] || die "Usage: codex-dev doctor [project]"
+  ensure_setup_dirs
+  need_cmd podman
+  need_cmd realpath
+  need_cmd sha256sum
+  need_cmd find
+  validate_image_prefix
+  printf 'codex-dev version: %s\n' "$VERSION"
+  printf 'user: %s uid=%s gid=%s\n' "$(id -un)" "$(id -u)" "$(id -g)"
+  [[ "$(id -u)" != "0" ]] || die "Do not run codex-dev as root. Use rootless Podman as your normal user."
+  printf 'projects root: %s\n' "$PROJECTS_ROOT"
+  ensure_projects_root_safe
+  printf 'projects root symlink: no\n'
+  info="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+  rootless="unknown"
+  [[ "$info" == "true" ]] && rootless="yes"
+  [[ "$info" == "false" ]] && rootless="no"
+  printf 'podman rootless: %s\n' "$rootless"
+  [[ "$rootless" == "yes" ]] || die "Could not confirm rootless Podman. podman info reported rootless=$rootless."
+  if command -v getenforce >/dev/null 2>&1; then
+    printf 'SELinux: %s\n' "$(getenforce)"
+  fi
+  if [[ -n "$name" ]]; then
+    require_project_name "$name"
+    real="$(project_path_real "$name")"
+    cfg="$(project_config_path "$name")"
+    load_project_config "$name"
+    img="$(image_name "$name")"
+    cname="$(container_name "$name")"
+    if [[ "$CFG_READ_ONLY_ROOT" == "yes" ]]; then effective_ro="yes"; else effective_ro="no"; fi
+    printf 'project: %s\n' "$name"
+    printf 'resource id: %s\n' "$(resource_id "$name")"
+    printf 'project real path: %s\n' "$real"
+    printf 'config: %s\n' "$cfg"
+    printf 'profile: %s\n' "$CFG_PROFILE"
+    printf 'read-only root by default: %s\n' "$effective_ro"
+    printf 'build script: %s\n' "${CFG_BUILD_SCRIPT:-none}"
+    printf 'image: %s\n' "$img"
+    if podman image exists "$img"; then
+      printf 'image exists: yes\n'
+    else
+      printf 'image exists: no\n'
+    fi
+    if podman container exists "$cname"; then
+      status="$(podman inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || printf 'unknown')"
+      printf 'container exists: yes (%s)\n' "$status"
+    else
+      printf 'container exists: no\n'
+    fi
+    check_project_tree_safety "$name"
+    if [[ "${CODEX_DEV_ALLOW_HARDLINKS:-0}" != "1" ]]; then
+      printf 'project tree safety: sockets/fifos/devices=none nested-mounts=none hardlinks=none detected\n'
+    else
+      printf 'project tree safety: sockets/fifos/devices=none nested-mounts=none hardlink check bypassed\n'
+    fi
+    printf 'runtime mount policy: exactly one host bind mount: %s -> /workspace\n' "$real"
+    printf 'project volume names:\n'
+    for kind in home cache npm cargo gradle go; do
+      vol="$(volume_name "$kind" "$name")"
+      printf '  %-8s %s\n' "$kind" "$vol"
+    done
+    printf 'forbidden mounts: home=no Projects-parent=no ssh=no config=no podman-socket=no docker-socket=no host-devices=no\n'
+    printf 'privileged: no\n'
+    printf 'host pid/ipc/network: no\n'
+    printf 'user namespace: keep-id\n'
+    printf 'SELinux project label option: :Z\n'
+  fi
+  log "doctor OK"
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    -h|--help|help|""|profiles) ;;
+    *) require_not_root ;;
+  esac
+  case "$cmd" in
+    setup) [[ $# -eq 0 ]] || die "Usage: codex-dev setup"; setup_cmd ;;
+    init) init_cmd "$@" ;;
+    profiles) [[ $# -eq 0 ]] || die "Usage: codex-dev profiles"; print_profiles ;;
+    list) [[ $# -eq 0 ]] || die "Usage: codex-dev list"; list_cmd ;;
+    config) [[ $# -eq 1 ]] || die "Usage: codex-dev config <project>"; config_cmd "$1" ;;
+    edit) [[ $# -eq 1 ]] || die "Usage: codex-dev edit <project>"; edit_cmd "$1" ;;
+    edit-build-script) [[ $# -eq 1 ]] || die "Usage: codex-dev edit-build-script <project>"; edit_build_script_cmd "$1" ;;
+    build) [[ $# -eq 1 ]] || die "Usage: codex-dev build <project>"; build_cmd "$1" ;;
+    shell) [[ $# -ge 1 ]] || die "Usage: codex-dev shell <project> [--rw-root]"; shell_cmd "$@" ;;
+    codex|enter) [[ $# -ge 1 ]] || die "Usage: codex-dev codex <project> [--rw-root] [-- <extra codex args...>]"; codex_cmd "$@" ;;
+    exec) [[ $# -ge 2 ]] || die "Usage: codex-dev exec <project> [--rw-root] -- <prompt>"; exec_cmd "$@" ;;
+    doctor) doctor_cmd "$@" ;;
+    volumes) [[ $# -eq 1 ]] || die "Usage: codex-dev volumes <project>"; volumes_cmd "$1" ;;
+    reset-cache) [[ $# -eq 1 ]] || die "Usage: codex-dev reset-cache <project>"; reset_cache_cmd "$1" ;;
+    reset-home) [[ $# -eq 1 ]] || die "Usage: codex-dev reset-home <project>"; reset_home_cmd "$1" ;;
+    nuke-env) [[ $# -eq 1 ]] || die "Usage: codex-dev nuke-env <project>"; nuke_env_cmd "$1" ;;
+    -h|--help|help|"") usage ;;
+    *) usage; die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
