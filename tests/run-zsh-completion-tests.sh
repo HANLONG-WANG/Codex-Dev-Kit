@@ -24,6 +24,18 @@ assert_file_exists() {
   local file="$1" label="$2"
   if [[ -f "$file" ]]; then ok "$label"; else fail "$label (missing $file)"; fi
 }
+assert_file_not_exists() {
+  local file="$1" label="$2"
+  if [[ ! -e "$file" ]]; then ok "$label"; else fail "$label (unexpectedly exists $file)"; fi
+}
+assert_dir_exists() {
+  local dir="$1" label="$2"
+  if [[ -d "$dir" ]]; then ok "$label"; else fail "$label (missing dir $dir)"; fi
+}
+assert_dir_not_exists() {
+  local dir="$1" label="$2"
+  if [[ ! -e "$dir" ]]; then ok "$label"; else fail "$label (unexpectedly exists $dir)"; fi
+}
 
 make_env() {
   TMP="$(mktemp -d)"
@@ -61,6 +73,75 @@ run_complete() {
   "$CODEX_DEV" __complete "$@"
 }
 
+resource_id_for_test() {
+  local name="$1" slug hash
+  slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[._-]+//; s/[._-]+$//')"
+  [[ -n "$slug" ]] || slug="project"
+  hash="$(printf '%s' "$name" | sha256sum | awk '{print substr($1,1,10)}')"
+  printf '%s-%s' "$slug" "$hash"
+}
+
+make_uninstall_env() {
+  TMP="$(mktemp -d)"
+  export HOME="$TMP/home"
+  export XDG_DATA_HOME="$HOME/.local/share"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export CODEX_DEV_PROJECTS_ROOT="$TMP/projects"
+  export PODMAN_LOG="$TMP/podman-remove.log"
+  FAKEBIN="$TMP/fakebin"
+  mkdir -p "$HOME/.local/bin" "$XDG_DATA_HOME/zsh/site-functions" "$XDG_DATA_HOME/codex-dev" "$XDG_CONFIG_HOME/codex-dev/build" "$CODEX_DEV_PROJECTS_ROOT" "$FAKEBIN"
+  cp "$CODEX_DEV" "$HOME/.local/bin/codex-dev"
+  printf 'completion\n' > "$XDG_DATA_HOME/zsh/site-functions/_codex-dev"
+  printf 'snippet\n' > "$XDG_DATA_HOME/codex-dev/zsh-completion.zsh"
+  printf 'build-cache\n' > "$XDG_CONFIG_HOME/codex-dev/build/cache.txt"
+  for project in app-one api_two; do
+    mkdir -p "$CODEX_DEV_PROJECTS_ROOT/$project/.codex-dev"
+    printf 'PROFILE=generic\n' > "$CODEX_DEV_PROJECTS_ROOT/$project/.codex-dev/project.env"
+    printf 'keep me\n' > "$CODEX_DEV_PROJECTS_ROOT/$project/.codex-dev/sentinel"
+  done
+  cat > "$FAKEBIN/podman" <<'PODMAN'
+#!/usr/bin/env bash
+case "${1:-}" in
+  info)
+    if [[ "${2:-}" == "--format" ]]; then printf '%s\n' "${PODMAN_ROOTLESS_VALUE:-true}"; exit 0; fi
+    exit 0
+    ;;
+  container|image|volume)
+    if [[ "${2:-}" == "exists" ]]; then exit 0; fi
+    if [[ "$1" == "image" && "${2:-}" == "rm" ]]; then echo "podman $*" >> "${PODMAN_LOG:?}"; exit 0; fi
+    if [[ "$1" == "volume" && "${2:-}" == "rm" ]]; then echo "podman $*" >> "${PODMAN_LOG:?}"; exit 0; fi
+    ;;
+  rm)
+    echo "podman $*" >> "${PODMAN_LOG:?}"
+    exit 0
+    ;;
+esac
+printf 'unexpected podman call: %s\n' "$*" >&2
+exit 1
+PODMAN
+  chmod +x "$FAKEBIN/podman"
+  export PATH="$FAKEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
+write_codex_dev_marker_rc() {
+  local rc="$1"
+  mkdir -p "$(dirname "$rc")"
+  cat > "$rc" <<'ZSHRC'
+before
+# BEGIN codex-dev zsh completion
+source '/tmp/old/codex-dev/zsh-completion.zsh'
+# END codex-dev zsh completion
+after
+ZSHRC
+}
+
+assert_projects_preserved() {
+  for project in app-one api_two; do
+    assert_file_exists "$CODEX_DEV_PROJECTS_ROOT/$project/.codex-dev/project.env" "$project project.env preserved"
+    assert_file_contains "$CODEX_DEV_PROJECTS_ROOT/$project/.codex-dev/sentinel" 'keep me' "$project .codex-dev sentinel preserved"
+  done
+}
+
 printf '1..unknown\n'
 
 bash -n "$CODEX_DEV" "$INSTALL" && ok 'bash syntax: codex-dev and install.sh' || fail 'bash syntax: codex-dev and install.sh'
@@ -84,7 +165,7 @@ else
 fi
 
 out="$(run_complete --current 2 -- codex-dev '')"
-for c in setup init profiles list config edit edit-build-script build shell codex enter exec doctor volumes reset-cache reset-home nuke-env completion; do
+for c in setup init profiles list config edit edit-build-script build shell codex enter exec doctor volumes reset-cache reset-home nuke-env uninstall completion; do
   assert_contains "$out" "$c" "top-level completion includes $c"
 done
 
@@ -268,6 +349,267 @@ profiles_out="$($CODEX_DEV profiles)"
 assert_contains "$profiles_out" 'python' 'profiles still lists python'
 help_out="$($CODEX_DEV --help)"
 assert_contains "$help_out" 'codex-dev shell <project>' 'help still works'
+assert_contains "$help_out" 'codex-dev uninstall' 'help includes uninstall'
+
+# Uninstall abort path: final confirmation refuses all changes after plan output.
+make_uninstall_env
+write_codex_dev_marker_rc "$HOME/.zshrc"
+chmod 0640 "$HOME/.zshrc"
+abort_out="$(printf 'y\ny\nn\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$abort_out" 'codex-dev uninstall plan' 'uninstall abort prints plan'
+assert_contains "$abort_out" 'Project directories and project .codex-dev metadata will be preserved.' 'uninstall plan states project metadata preservation'
+assert_file_exists "$HOME/.local/bin/codex-dev" 'abort keeps installed binary'
+assert_file_exists "$XDG_DATA_HOME/zsh/site-functions/_codex-dev" 'abort keeps zsh completion'
+assert_file_exists "$XDG_DATA_HOME/codex-dev/zsh-completion.zsh" 'abort keeps zsh snippet'
+assert_file_exists "$XDG_CONFIG_HOME/codex-dev/build/cache.txt" 'abort keeps config build cache'
+assert_file_contains "$HOME/.zshrc" 'BEGIN codex-dev zsh completion' 'abort keeps zsh marker'
+assert_projects_preserved
+if [[ ! -e "$PODMAN_LOG" ]]; then ok 'abort performs no podman removals'; else fail "abort unexpectedly removed podman resources: $(cat "$PODMAN_LOG")"; fi
+
+# Confirmed uninstall with image and volume removal.
+make_uninstall_env
+write_codex_dev_marker_rc "$HOME/.zshrc"
+chmod 0640 "$HOME/.zshrc"
+confirm_out="$(printf 'y\ny\ny\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$confirm_out" 'Podman images:  remove' 'confirmed uninstall records image removal choice'
+assert_contains "$confirm_out" 'Podman volumes: remove' 'confirmed uninstall records volume removal choice'
+assert_file_not_exists "$HOME/.local/bin/codex-dev" 'confirmed uninstall removes installed binary'
+assert_file_not_exists "$XDG_DATA_HOME/zsh/site-functions/_codex-dev" 'confirmed uninstall removes zsh completion'
+assert_dir_not_exists "$XDG_DATA_HOME/codex-dev" 'confirmed uninstall removes codex-dev data dir'
+assert_dir_not_exists "$XDG_CONFIG_HOME/codex-dev" 'confirmed uninstall removes codex-dev config dir'
+assert_dir_exists "$HOME/.local/bin" 'confirmed uninstall preserves ~/.local/bin parent'
+assert_dir_exists "$XDG_DATA_HOME" 'confirmed uninstall preserves XDG data parent'
+assert_dir_exists "$XDG_DATA_HOME/zsh" 'confirmed uninstall preserves XDG zsh parent'
+assert_dir_exists "$XDG_DATA_HOME/zsh/site-functions" 'confirmed uninstall preserves site-functions parent'
+assert_dir_exists "$XDG_CONFIG_HOME" 'confirmed uninstall preserves XDG config parent'
+assert_dir_exists "$CODEX_DEV_PROJECTS_ROOT" 'confirmed uninstall preserves projects root'
+assert_file_contains "$HOME/.zshrc" 'before' 'confirmed uninstall preserves zshrc content before marker'
+assert_file_contains "$HOME/.zshrc" 'after' 'confirmed uninstall preserves zshrc content after marker'
+assert_not_contains "$(cat "$HOME/.zshrc")" 'BEGIN codex-dev zsh completion' 'confirmed uninstall removes zsh marker'
+mode_after="$(stat -c '%a' "$HOME/.zshrc")"
+[[ "$mode_after" == "640" ]] && ok 'confirmed uninstall preserves zshrc mode' || fail "confirmed uninstall changed zshrc mode: $mode_after"
+assert_projects_preserved
+for project in app-one api_two; do
+  rid="$(resource_id_for_test "$project")"
+  log_text="$(cat "$PODMAN_LOG")"
+  assert_contains "$log_text" "podman rm -f codex-dev-$rid" "$project container removed"
+  assert_contains "$log_text" "podman image rm -f localhost/codex-dev/$rid:latest" "$project image removed"
+  for kind in home cache npm cargo gradle go; do
+    assert_contains "$log_text" "podman volume rm codex-dev-$kind-$rid" "$project $kind volume removed"
+  done
+done
+
+# Confirmed uninstall can keep images and volumes while still removing containers/local files.
+make_uninstall_env
+write_codex_dev_marker_rc "$HOME/.zshrc"
+keep_out="$(printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$keep_out" 'Podman images:  keep' 'keep branch records image keep choice'
+assert_contains "$keep_out" 'Podman volumes: keep' 'keep branch records volume keep choice'
+assert_file_not_exists "$HOME/.local/bin/codex-dev" 'keep branch still removes installed binary'
+log_text="$(cat "$PODMAN_LOG")"
+assert_contains "$log_text" 'podman rm -f codex-dev-app-one-' 'keep branch removes containers'
+assert_not_contains "$log_text" 'podman image rm' 'keep branch does not remove images'
+assert_not_contains "$log_text" 'podman volume rm' 'keep branch does not remove volumes'
+assert_projects_preserved
+
+# Rootful Podman is rejected before uninstall deletes local files or resources.
+make_uninstall_env
+write_codex_dev_marker_rc "$HOME/.zshrc"
+export PODMAN_ROOTLESS_VALUE=false
+if printf 'y\ny\ny\n' | "$CODEX_DEV" uninstall >/tmp/codex-dev-rootful-uninstall.out 2>/tmp/codex-dev-rootful-uninstall.err; then
+  fail 'rootful podman uninstall should fail'
+else
+  ok 'rootful podman uninstall fails closed'
+fi
+unset PODMAN_ROOTLESS_VALUE
+assert_file_exists "$HOME/.local/bin/codex-dev" 'rootful podman keeps installed binary'
+assert_file_exists "$XDG_DATA_HOME/zsh/site-functions/_codex-dev" 'rootful podman keeps zsh completion'
+assert_file_exists "$XDG_DATA_HOME/codex-dev/zsh-completion.zsh" 'rootful podman keeps zsh snippet'
+assert_file_exists "$XDG_CONFIG_HOME/codex-dev/build/cache.txt" 'rootful podman keeps build cache'
+assert_file_contains "$HOME/.zshrc" 'BEGIN codex-dev zsh completion' 'rootful podman keeps zsh marker'
+if [[ ! -e "$PODMAN_LOG" ]]; then ok 'rootful podman performs no podman removals'; else fail "rootful podman unexpectedly removed resources: $(cat "$PODMAN_LOG")"; fi
+assert_projects_preserved
+
+# Extra user files under codex-dev namespaces keep their parent dirs from being pruned.
+make_uninstall_env
+write_codex_dev_marker_rc "$HOME/.zshrc"
+printf 'user config\n' > "$XDG_CONFIG_HOME/codex-dev/user-extra.conf"
+printf 'user data\n' > "$XDG_DATA_HOME/codex-dev/user-extra.txt"
+printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall >/tmp/codex-dev-extra-files-uninstall.out 2>/tmp/codex-dev-extra-files-uninstall.err
+assert_file_not_exists "$XDG_CONFIG_HOME/codex-dev/build/cache.txt" 'extra-file uninstall removes generated build cache file'
+assert_file_not_exists "$XDG_DATA_HOME/codex-dev/zsh-completion.zsh" 'extra-file uninstall removes zsh snippet leaf'
+assert_file_contains "$XDG_CONFIG_HOME/codex-dev/user-extra.conf" 'user config' 'extra config file preserved'
+assert_file_contains "$XDG_DATA_HOME/codex-dev/user-extra.txt" 'user data' 'extra data file preserved'
+assert_dir_exists "$XDG_CONFIG_HOME/codex-dev" 'extra config file keeps config dir'
+assert_dir_exists "$XDG_DATA_HOME/codex-dev" 'extra data file keeps data dir'
+assert_projects_preserved
+
+# Broad custom CODEX_DEV_CONFIG_DIR does not allow automatic build/ recursive deletion.
+make_uninstall_env
+broad_config="$TMP/broad-config"
+mkdir -p "$broad_config/build"
+printf 'broad build data\n' > "$broad_config/build/user.txt"
+broad_out="$(printf 'n\nn\ny\n' | CODEX_DEV_CONFIG_DIR="$broad_config" "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$broad_out" 'Not automatically removing build directory under broad config path' 'broad config build cleanup is manual'
+assert_file_contains "$broad_config/build/user.txt" 'broad build data' 'broad config build data preserved'
+assert_dir_exists "$broad_config/build" 'broad config build dir preserved'
+assert_projects_preserved
+
+# ZDOTDIR-aware rc cleanup targets ${ZDOTDIR}/.zshrc, not $HOME/.zshrc.
+make_uninstall_env
+export ZDOTDIR="$TMP/zdot"
+mkdir -p "$ZDOTDIR"
+printf 'home rc sentinel\n' > "$HOME/.zshrc"
+write_codex_dev_marker_rc "$ZDOTDIR/.zshrc"
+printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall >/tmp/codex-dev-zdot-uninstall.out 2>/tmp/codex-dev-zdot-uninstall.err
+assert_file_contains "$HOME/.zshrc" 'home rc sentinel' 'ZDOTDIR uninstall leaves HOME .zshrc untouched'
+assert_file_contains "$ZDOTDIR/.zshrc" 'before' 'ZDOTDIR uninstall preserves rc content before marker'
+assert_not_contains "$(cat "$ZDOTDIR/.zshrc")" 'BEGIN codex-dev zsh completion' 'ZDOTDIR uninstall removes marker from ZDOTDIR rc'
+unset ZDOTDIR
+assert_projects_preserved
+
+# Rc paths containing ':' are handled as paths, not delimiter-encoded strings.
+make_uninstall_env
+colon_zdot="$TMP/zdot:with:colon"
+export ZDOTDIR="$colon_zdot"
+mkdir -p "$ZDOTDIR"
+write_codex_dev_marker_rc "$ZDOTDIR/.zshrc"
+printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall >/tmp/codex-dev-colon-zdot-uninstall.out 2>/tmp/codex-dev-colon-zdot-uninstall.err
+assert_file_contains "$ZDOTDIR/.zshrc" 'before' 'colon ZDOTDIR uninstall preserves rc content before marker'
+assert_not_contains "$(cat "$ZDOTDIR/.zshrc")" 'BEGIN codex-dev zsh completion' 'colon ZDOTDIR uninstall removes marker from intended rc'
+unset ZDOTDIR
+assert_projects_preserved
+
+# Symlinked rc is not replaced and its target is not modified.
+make_uninstall_env
+mkdir -p "$TMP/dotfiles"
+write_codex_dev_marker_rc "$TMP/dotfiles/zshrc"
+ln -s "$TMP/dotfiles/zshrc" "$HOME/.zshrc"
+link_before="$(readlink "$HOME/.zshrc")"
+target_before="$(cat "$TMP/dotfiles/zshrc")"
+printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall >/tmp/codex-dev-symlink-uninstall.out 2>/tmp/codex-dev-symlink-uninstall.err
+[[ -L "$HOME/.zshrc" && "$(readlink "$HOME/.zshrc")" == "$link_before" ]] && ok 'uninstall keeps symlinked zshrc as symlink' || fail 'uninstall replaced symlinked zshrc'
+[[ "$(cat "$TMP/dotfiles/zshrc")" == "$target_before" ]] && ok 'uninstall does not modify symlinked zshrc target' || fail 'uninstall modified symlinked zshrc target'
+assert_projects_preserved
+
+# Trailing slash on symlinked config dir must not delete the symlink target contents.
+make_uninstall_env
+rm -rf "$XDG_CONFIG_HOME/codex-dev"
+mkdir -p "$TMP/config-real"
+printf 'target data\n' > "$TMP/config-real/keep.txt"
+ln -s "$TMP/config-real" "$XDG_CONFIG_HOME/codex-dev"
+CODEX_DEV_CONFIG_DIR="$XDG_CONFIG_HOME/codex-dev/" printf 'n\nn\ny\n' | CODEX_DEV_CONFIG_DIR="$XDG_CONFIG_HOME/codex-dev/" "$CODEX_DEV" uninstall >/tmp/codex-dev-config-symlink-uninstall.out 2>/tmp/codex-dev-config-symlink-uninstall.err
+assert_file_contains "$TMP/config-real/keep.txt" 'target data' 'trailing-slash symlink config target contents preserved'
+[[ -L "$XDG_CONFIG_HOME/codex-dev" ]] && ok 'trailing-slash symlink config remains symlink' || fail 'trailing-slash symlink config was removed or replaced'
+assert_projects_preserved
+
+# Symlinked XDG_CONFIG_HOME ancestor must not redirect generated directory cleanup.
+make_uninstall_env
+config_real="$TMP/config-home-real"
+config_link="$TMP/config-home-link"
+rm -rf "$config_real" "$config_link"
+mkdir -p "$config_real/codex-dev/build"
+printf 'real build data\n' > "$config_real/codex-dev/build/keep.txt"
+ln -s "$config_real" "$config_link"
+config_ancestor_out="$(printf 'n\nn\ny\n' | XDG_CONFIG_HOME="$config_link" "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$config_ancestor_out" 'Not automatically removing config build directory through symlinked parent' 'symlinked XDG_CONFIG_HOME build cleanup is manual'
+assert_file_contains "$config_real/codex-dev/build/keep.txt" 'real build data' 'symlinked XDG_CONFIG_HOME build target preserved'
+assert_dir_exists "$config_real/codex-dev/build" 'symlinked XDG_CONFIG_HOME build dir preserved'
+assert_projects_preserved
+
+# Symlinked data parents must not redirect file leaf deletion into their targets.
+make_uninstall_env
+rm -rf "$XDG_DATA_HOME/codex-dev"
+mkdir -p "$TMP/data-real"
+printf 'target snippet\n' > "$TMP/data-real/zsh-completion.zsh"
+ln -s "$TMP/data-real" "$XDG_DATA_HOME/codex-dev"
+data_symlink_out="$(printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$data_symlink_out" 'Not automatically removing zsh snippet through symlinked parent' 'symlinked data dir snippet is reported for manual cleanup'
+assert_file_contains "$TMP/data-real/zsh-completion.zsh" 'target snippet' 'symlinked data dir target snippet preserved'
+[[ -L "$XDG_DATA_HOME/codex-dev" ]] && ok 'symlinked data dir remains symlink' || fail 'symlinked data dir was removed or replaced'
+assert_projects_preserved
+
+make_uninstall_env
+rm -rf "$XDG_DATA_HOME/zsh/site-functions"
+mkdir -p "$TMP/site-functions-real"
+printf 'target completion\n' > "$TMP/site-functions-real/_codex-dev"
+ln -s "$TMP/site-functions-real" "$XDG_DATA_HOME/zsh/site-functions"
+site_symlink_out="$(printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$site_symlink_out" 'Not automatically removing zsh completion through symlinked parent' 'symlinked site-functions completion is reported for manual cleanup'
+assert_file_contains "$TMP/site-functions-real/_codex-dev" 'target completion' 'symlinked site-functions target completion preserved'
+[[ -L "$XDG_DATA_HOME/zsh/site-functions" ]] && ok 'symlinked site-functions remains symlink' || fail 'symlinked site-functions was removed or replaced'
+assert_projects_preserved
+
+# Symlinked XDG_DATA_HOME ancestor must not redirect completion/snippet deletion.
+make_uninstall_env
+data_home_real="$TMP/data-home-real"
+data_home_link="$TMP/data-home-link"
+rm -rf "$data_home_real" "$data_home_link"
+mkdir -p "$data_home_real/zsh/site-functions" "$data_home_real/codex-dev"
+printf 'real completion\n' > "$data_home_real/zsh/site-functions/_codex-dev"
+printf 'real snippet\n' > "$data_home_real/codex-dev/zsh-completion.zsh"
+ln -s "$data_home_real" "$data_home_link"
+data_ancestor_out="$(printf 'n\nn\ny\n' | XDG_DATA_HOME="$data_home_link" "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$data_ancestor_out" 'Not automatically removing zsh completion through symlinked parent' 'symlinked XDG_DATA_HOME completion cleanup is manual'
+assert_contains "$data_ancestor_out" 'Not automatically removing zsh snippet through symlinked parent' 'symlinked XDG_DATA_HOME snippet cleanup is manual'
+assert_file_contains "$data_home_real/zsh/site-functions/_codex-dev" 'real completion' 'symlinked XDG_DATA_HOME completion target preserved'
+assert_file_contains "$data_home_real/codex-dev/zsh-completion.zsh" 'real snippet' 'symlinked XDG_DATA_HOME snippet target preserved'
+assert_projects_preserved
+
+# Symlinked ZDOTDIR ancestor must not redirect rc rewrite.
+make_uninstall_env
+zdot_real="$TMP/zdot-real"
+zdot_link="$TMP/zdot-link"
+mkdir -p "$zdot_real"
+write_codex_dev_marker_rc "$zdot_real/.zshrc"
+ln -s "$zdot_real" "$zdot_link"
+zdot_target_before="$(cat "$zdot_real/.zshrc")"
+zdot_ancestor_out="$(printf 'n\nn\ny\n' | ZDOTDIR="$zdot_link" "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$zdot_ancestor_out" 'Not automatically editing zsh rc through symlinked parent' 'symlinked ZDOTDIR rc cleanup is manual'
+[[ "$(cat "$zdot_real/.zshrc")" == "$zdot_target_before" ]] && ok 'symlinked ZDOTDIR rc target preserved' || fail 'symlinked ZDOTDIR rc target was modified'
+assert_projects_preserved
+
+# Malformed rc markers are never rewritten automatically.
+make_uninstall_env
+cat > "$HOME/.zshrc" <<'ZSHRC'
+before
+# BEGIN codex-dev zsh completion
+source /tmp/malformed
+after-user-config
+ZSHRC
+before_malformed="$(cat "$HOME/.zshrc")"
+malformed_out="$(printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$malformed_out" 'Malformed zsh rc marker block will not be modified automatically' 'malformed begin-only marker is reported for manual cleanup'
+[[ "$(cat "$HOME/.zshrc")" == "$before_malformed" ]] && ok 'malformed begin-only marker leaves zshrc untouched' || fail 'malformed begin-only marker changed zshrc'
+assert_projects_preserved
+
+make_uninstall_env
+cat > "$HOME/.zshrc" <<'ZSHRC'
+before
+# END codex-dev zsh completion
+after-user-config
+ZSHRC
+before_malformed="$(cat "$HOME/.zshrc")"
+malformed_out="$(printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$malformed_out" 'Malformed zsh rc marker block will not be modified automatically' 'malformed end-only marker is reported for manual cleanup'
+[[ "$(cat "$HOME/.zshrc")" == "$before_malformed" ]] && ok 'malformed end-only marker leaves zshrc untouched' || fail 'malformed end-only marker changed zshrc'
+assert_projects_preserved
+
+make_uninstall_env
+cat > "$HOME/.zshrc" <<'ZSHRC'
+before
+# BEGIN codex-dev zsh completion
+source /tmp/outer
+# BEGIN codex-dev zsh completion
+source /tmp/inner
+# END codex-dev zsh completion
+after-user-config
+ZSHRC
+before_malformed="$(cat "$HOME/.zshrc")"
+malformed_out="$(printf 'n\nn\ny\n' | "$CODEX_DEV" uninstall 2>&1)"
+assert_contains "$malformed_out" 'Malformed zsh rc marker block will not be modified automatically' 'nested marker is reported for manual cleanup'
+[[ "$(cat "$HOME/.zshrc")" == "$before_malformed" ]] && ok 'nested marker leaves zshrc untouched' || fail 'nested marker changed zshrc'
+assert_projects_preserved
 
 if [[ "$failures" -eq 0 ]]; then
   printf 'All zsh completion tests passed.\n'

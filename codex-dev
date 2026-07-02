@@ -51,6 +51,7 @@ Usage:
   codex-dev reset-cache <project>
   codex-dev reset-home <project>
   codex-dev nuke-env <project>
+  codex-dev uninstall
   codex-dev completion zsh [--command <absolute-path>]
 
 Environment overrides:
@@ -310,6 +311,7 @@ volumes
 reset-cache
 reset-home
 nuke-env
+uninstall
 completion
 EOF_COMMANDS
 }
@@ -1049,6 +1051,327 @@ nuke_env_cmd() {
   log "Project directory was not touched: $(project_path_literal "$name")"
 }
 
+MARKER_BEGIN="# BEGIN codex-dev zsh completion"
+MARKER_END="# END codex-dev zsh completion"
+
+prompt_yes_no() {
+  local prompt="$1" default="${2:-no}" answer suffix
+  case "$default" in
+    yes) suffix="[Y/n]" ;;
+    no) suffix="[y/N]" ;;
+    *) die "Internal error: invalid prompt default: $default" ;;
+  esac
+  while true; do
+    printf '%s %s ' "$prompt" "$suffix" >&2
+    if ! IFS= read -r answer; then
+      answer=""
+    fi
+    answer="$(trim "$answer")"
+    if [[ -z "$answer" ]]; then
+      [[ "$default" == "yes" ]] && return 0 || return 1
+    fi
+    case "$answer" in
+      y|Y|yes|YES|Yes) return 0 ;;
+      n|N|no|NO|No) return 1 ;;
+      *) warn "Please answer yes or no." ;;
+    esac
+  done
+}
+
+zshrc_path() {
+  local zdot
+  zdot="$(expand_leading_tilde "${ZDOTDIR:-$HOME}")"
+  printf '%s/.zshrc' "$zdot"
+}
+
+zshrc_has_codex_dev_marker() {
+  local rc="$1"
+  [[ -f "$rc" && ! -L "$rc" ]] || return 1
+  local line in_marker=0 begin_count=0 end_count=0 malformed=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$MARKER_BEGIN" ]]; then
+      if [[ "$in_marker" -eq 1 ]]; then
+        malformed=1
+      fi
+      in_marker=1
+      begin_count=$((begin_count + 1))
+      continue
+    fi
+    if [[ "$line" == "$MARKER_END" ]]; then
+      if [[ "$in_marker" -ne 1 ]]; then
+        malformed=1
+      fi
+      in_marker=0
+      end_count=$((end_count + 1))
+      continue
+    fi
+  done < "$rc"
+  [[ "$in_marker" -eq 0 && "$malformed" -eq 0 && "$begin_count" -eq 1 && "$end_count" -eq 1 ]]
+}
+
+zshrc_has_any_codex_dev_marker() {
+  local rc="$1"
+  [[ -f "$rc" && ! -L "$rc" ]] || return 1
+  grep -Fxq "$MARKER_BEGIN" "$rc" || grep -Fxq "$MARKER_END" "$rc"
+}
+
+remove_codex_dev_zsh_marker() {
+  local rc="$1" tmp line in_marker=0 removed=0
+  if [[ -L "$rc" ]]; then
+    warn "Not modifying symlinked zsh rc: $rc"
+    return 0
+  fi
+  if path_has_symlink_parent "$rc"; then
+    warn "Not modifying zsh rc through symlinked parent; inspect manually: $rc"
+    return 0
+  fi
+  [[ -f "$rc" ]] || return 0
+  if ! zshrc_has_codex_dev_marker "$rc"; then
+    if zshrc_has_any_codex_dev_marker "$rc"; then
+      warn "Not modifying malformed zsh rc marker block; inspect manually: $rc"
+    fi
+    return 0
+  fi
+  tmp="$(mktemp "$(dirname "$rc")/.$(basename "$rc").codex-dev-uninstall.XXXXXX")" || die "Failed to create temporary rc file next to $rc"
+  cp -p -- "$rc" "$tmp" 2>/dev/null || true
+  : > "$tmp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$MARKER_BEGIN" ]]; then
+      in_marker=1
+      removed=1
+      continue
+    fi
+    if [[ "$line" == "$MARKER_END" && "$in_marker" -eq 1 ]]; then
+      in_marker=0
+      continue
+    fi
+    [[ "$in_marker" -eq 1 ]] && continue
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$rc"
+  if [[ "$removed" -eq 1 ]]; then
+    chmod --reference="$rc" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$rc"
+    log "Removed zsh rc marker: $rc"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+podman_exists_quietly() {
+  local kind="$1" name="$2"
+  command -v podman >/dev/null 2>&1 || return 1
+  case "$kind" in
+    container) podman container exists "$name" >/dev/null 2>&1 ;;
+    image) podman image exists "$name" >/dev/null 2>&1 ;;
+    volume) podman volume exists "$name" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+print_plan_section() {
+  local title="$1"
+  shift
+  printf '%s\n' "$title"
+  if [[ "$#" -eq 0 ]]; then
+    printf '  (none)\n'
+    return 0
+  fi
+  local item
+  for item in "$@"; do
+    printf '  - %s\n' "$item"
+  done
+}
+
+strip_trailing_slashes() {
+  local path="$1"
+  while [[ "$path" != "/" && "$path" == */ ]]; do
+    path="${path%/}"
+  done
+  printf '%s' "$path"
+}
+
+path_has_symlink_parent() {
+  local path="$1" dir parent root_seen=0
+  dir="$(dirname "$path")"
+  [[ "$dir" == "." ]] && return 1
+  while [[ "$dir" != "/" && "$dir" != "." ]]; do
+    if [[ -L "$dir" ]]; then
+      return 0
+    fi
+    parent="$(dirname "$dir")"
+    [[ "$parent" != "$dir" ]] || break
+    dir="$parent"
+    root_seen=1
+  done
+  [[ "$root_seen" -eq 1 ]] || return 1
+  return 1
+}
+
+add_uninstall_file_target_or_note() {
+  local path="$1" label="$2"
+  path="$(strip_trailing_slashes "$path")"
+  [[ -e "$path" && ! -d "$path" ]] || return 0
+  if path_has_symlink_parent "$path"; then
+    notes+=("Not automatically removing $label through symlinked parent; inspect manually: $path")
+    return 0
+  fi
+  file_targets+=("$path")
+}
+
+add_empty_parent_target_or_note() {
+  local path="$1" label="$2"
+  local base parent
+  path="$(strip_trailing_slashes "$path")"
+  [[ -d "$path" && ! -L "$path" ]] || return 0
+  if path_has_symlink_parent "$path"; then
+    notes+=("Not automatically pruning $label directory through symlinked parent; inspect manually: $path")
+    return 0
+  fi
+  base="$(basename "$path")"
+  parent="$(dirname "$path")"
+  if [[ "$base" == "codex-dev" && "$path" != "/" && "$path" != "$HOME" && "$path" != "$parent" ]]; then
+    empty_dir_targets+=("$path")
+  else
+    notes+=("Not automatically pruning broad $label directory; inspect manually: $path")
+  fi
+}
+
+add_generated_dir_target() {
+  local path="$1" label="$2"
+  path="$(strip_trailing_slashes "$path")"
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    if path_has_symlink_parent "$path"; then
+      notes+=("Not automatically removing $label directory through symlinked parent; inspect manually: $path")
+      return 0
+    fi
+    generated_dir_targets+=("$path")
+  elif [[ -L "$path" ]]; then
+    notes+=("Not automatically removing symlinked $label directory; inspect manually: $path")
+  fi
+}
+
+uninstall_cmd() {
+  [[ $# -eq 0 ]] || die "Usage: codex-dev uninstall"
+  local remove_images="no" remove_volumes="no" data_home zsh_completion data_dir zsh_snippet rc installed_bin
+  local name kind cname img vol config_dir_norm build_root_norm
+  local -a file_targets=() generated_dir_targets=() empty_dir_targets=() rc_targets=() rc_plan_targets=() containers=() images=() volumes=() notes=()
+
+  if prompt_yes_no "Remove codex-dev Podman images?" no; then
+    remove_images="yes"
+  fi
+  if prompt_yes_no "Remove codex-dev Podman volumes, including per-project Codex login/cache state?" no; then
+    remove_volumes="yes"
+  fi
+
+  data_home="$(expand_leading_tilde "${XDG_DATA_HOME:-$HOME/.local/share}")"
+  installed_bin="$HOME/.local/bin/codex-dev"
+  zsh_completion="$data_home/zsh/site-functions/_codex-dev"
+  data_dir="$data_home/codex-dev"
+  zsh_snippet="$data_dir/zsh-completion.zsh"
+  rc="$(zshrc_path)"
+
+  add_uninstall_file_target_or_note "$installed_bin" "installed binary"
+  add_uninstall_file_target_or_note "$zsh_completion" "zsh completion"
+  add_uninstall_file_target_or_note "$zsh_snippet" "zsh snippet"
+  config_dir_norm="$(strip_trailing_slashes "$CONFIG_DIR")"
+  build_root_norm="$config_dir_norm/build"
+  if [[ -d "$config_dir_norm" && ! -L "$config_dir_norm" && "$(basename "$config_dir_norm")" == "codex-dev" ]]; then
+    add_generated_dir_target "$build_root_norm" "config build"
+  elif [[ -d "$build_root_norm" ]]; then
+    notes+=("Not automatically removing build directory under broad config path; inspect manually: $build_root_norm")
+  elif [[ -L "$config_dir_norm" ]]; then
+    notes+=("Not automatically removing symlinked config directory; inspect manually: $config_dir_norm")
+  fi
+  add_empty_parent_target_or_note "$config_dir_norm" "config"
+  add_empty_parent_target_or_note "$data_dir" "data"
+  if zshrc_has_codex_dev_marker "$rc"; then
+    if path_has_symlink_parent "$rc"; then
+      notes+=("Not automatically editing zsh rc through symlinked parent; inspect manually: $rc")
+    else
+      rc_targets+=("$rc")
+      rc_plan_targets+=("$rc: remove codex-dev marker block")
+    fi
+  elif zshrc_has_any_codex_dev_marker "$rc"; then
+    notes+=("Malformed zsh rc marker block will not be modified automatically; inspect manually: $rc")
+  elif [[ -L "$rc" ]]; then
+    notes+=("Symlinked zsh rc will not be modified: $rc")
+  fi
+
+  if command -v podman >/dev/null 2>&1; then
+    ensure_podman_rootless
+    need_cmd sha256sum
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      cname="$(container_name "$name")"
+      podman_exists_quietly container "$cname" && containers+=("$cname")
+      if [[ "$remove_images" == "yes" ]]; then
+        img="$(image_name "$name")"
+        podman_exists_quietly image "$img" && images+=("$img")
+      fi
+      if [[ "$remove_volumes" == "yes" ]]; then
+        for kind in home cache npm cargo gradle go; do
+          vol="$(volume_name "$kind" "$name")"
+          podman_exists_quietly volume "$vol" && volumes+=("$vol")
+        done
+      fi
+    done < <(managed_project_names)
+  else
+    notes+=("Podman not found; no Podman resources were planned for removal.")
+  fi
+
+  printf '\n%s\n' "codex-dev uninstall plan"
+  printf '%s\n' "Podman images:  $([[ "$remove_images" == "yes" ]] && printf remove || printf keep)"
+  printf '%s\n' "Podman volumes: $([[ "$remove_volumes" == "yes" ]] && printf remove || printf keep)"
+  print_plan_section "Files to remove:" "${file_targets[@]}"
+  print_plan_section "Generated directories to remove:" "${generated_dir_targets[@]}"
+  print_plan_section "Empty codex-dev directories to prune:" "${empty_dir_targets[@]}"
+  print_plan_section "Zsh rc edits:" "${rc_plan_targets[@]}"
+  print_plan_section "Podman containers to remove:" "${containers[@]}"
+  print_plan_section "Podman images to remove:" "${images[@]}"
+  print_plan_section "Podman volumes to remove:" "${volumes[@]}"
+  print_plan_section "Notes:" "${notes[@]}"
+  printf '%s\n' "Project directories and project .codex-dev metadata will be preserved."
+  printf '\n'
+
+  if ! prompt_yes_no "Proceed with uninstall?" no; then
+    log "Uninstall aborted; no changes were made."
+    return 0
+  fi
+
+  for cname in "${containers[@]}"; do
+    podman rm -f "$cname" >/dev/null || die "Failed to remove container: $cname"
+    log "Removed container: $cname"
+  done
+  for img in "${images[@]}"; do
+    podman image rm -f "$img" >/dev/null || die "Failed to remove image: $img"
+    log "Removed image: $img"
+  done
+  for vol in "${volumes[@]}"; do
+    podman volume rm "$vol" >/dev/null || die "Failed to remove volume: $vol"
+    log "Removed volume: $vol"
+  done
+  for rc in "${rc_targets[@]}"; do
+    remove_codex_dev_zsh_marker "$rc"
+  done
+  for installed_bin in "${file_targets[@]}"; do
+    rm -f -- "$installed_bin" || die "Failed to remove file: $installed_bin"
+    log "Removed file: $installed_bin"
+  done
+  for data_dir in "${generated_dir_targets[@]}"; do
+    rm -rf -- "$data_dir" || die "Failed to remove generated directory: $data_dir"
+    log "Removed generated directory: $data_dir"
+  done
+  for data_dir in "${empty_dir_targets[@]}"; do
+    if rmdir -- "$data_dir" 2>/dev/null; then
+      log "Removed empty directory: $data_dir"
+    else
+      log "Directory not empty; preserved: $data_dir"
+    fi
+  done
+
+  log "Uninstall complete. Project directories and project .codex-dev metadata were preserved."
+}
+
 doctor_cmd() {
   local name="${1:-}" rootless info img real cfg cname status kind vol effective_ro
   [[ $# -le 1 ]] || die "Usage: codex-dev doctor [project]"
@@ -1145,6 +1468,7 @@ main() {
     reset-cache) [[ $# -eq 1 ]] || die "Usage: codex-dev reset-cache <project>"; reset_cache_cmd "$1" ;;
     reset-home) [[ $# -eq 1 ]] || die "Usage: codex-dev reset-home <project>"; reset_home_cmd "$1" ;;
     nuke-env) [[ $# -eq 1 ]] || die "Usage: codex-dev nuke-env <project>"; nuke_env_cmd "$1" ;;
+    uninstall) uninstall_cmd "$@" ;;
     completion) completion_cmd "$@" ;;
     __complete) complete_cmd_internal "$@" ;;
     -h|--help|help|"") usage ;;

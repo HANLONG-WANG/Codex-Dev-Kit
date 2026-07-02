@@ -31,6 +31,14 @@ CODEX_DEV_SKIP_COMPLETIONS=1 ./install.sh  # do not install completion files or 
 CODEX_DEV_SKIP_RC=1 ./install.sh           # install completion files, but do not edit .zshrc
 ```
 
+Uninstall:
+
+```bash
+codex-dev uninstall
+```
+
+`uninstall` asks whether to remove codex-dev Podman images and volumes, then prints the exact local files, directories, Zsh rc edits, and selected Podman resources that will be removed. Nothing is deleted until you confirm the final plan. Project directories and `.codex-dev` metadata created by `codex-dev init` are preserved.
+
 ## Typical workflow
 
 ```bash
@@ -126,6 +134,7 @@ codex-dev volumes <project>
 codex-dev reset-cache <project>
 codex-dev reset-home <project>
 codex-dev nuke-env <project>
+codex-dev uninstall
 codex-dev completion zsh [--command <absolute-path>]
 ```
 
