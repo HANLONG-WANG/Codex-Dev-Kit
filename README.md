@@ -2,6 +2,8 @@
 
 `codex-dev` v0.2.2-local is a rootless Podman manager for running Codex inside a Fedora container with a fixed host isolation policy.
 
+中文文档：[README_CN.md](README_CN.md)
+
 ## Security model
 
 - Codex runs inside the container with `--sandbox danger-full-access --ask-for-approval never`.
