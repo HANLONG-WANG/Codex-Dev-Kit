@@ -261,8 +261,10 @@ if [[ "$ZSH_RC_STATUS" == manual* ]]; then
   cat <<MSG
 
 Manual Zsh completion step:
-  Add this line before your existing compinit/plugin-manager completion initialization:
+  Source the installed helper snippet before your existing compinit/plugin-manager completion initialization:
        source $ZSH_SNIPPET_FILE_QUOTED
+  Note: the completion function itself was installed under:
+       $ZSH_COMPLETION_FILE
   Keyword: source-before-compinit
 MSG
 fi
