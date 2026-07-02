@@ -16,6 +16,14 @@ assert_not_contains() {
   local haystack="$1" needle="$2" label="$3"
   if [[ "$haystack" != *"$needle"* ]]; then ok "$label"; else fail "$label (unexpected: $needle)"; fi
 }
+assert_has_line() {
+  local haystack="$1" needle="$2" label="$3"
+  if grep -Fxq -- "$needle" <<< "$haystack"; then ok "$label"; else fail "$label (missing line: $needle)"; fi
+}
+assert_lacks_line() {
+  local haystack="$1" needle="$2" label="$3"
+  if ! grep -Fxq -- "$needle" <<< "$haystack"; then ok "$label"; else fail "$label (unexpected line: $needle)"; fi
+}
 assert_file_contains() {
   local file="$1" needle="$2" label="$3"
   if [[ -f "$file" ]] && grep -Fq -- "$needle" "$file"; then ok "$label"; else fail "$label (missing in $file: $needle)"; fi
@@ -66,6 +74,42 @@ exit 99
 PODMAN
   chmod +x "$FAKEBIN/podman"
   export PODMAN_INVOKED_MARKER="$TMP/podman-invoked"
+  export PATH="$FAKEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
+make_runtime_env() {
+  TMP="$(mktemp -d)"
+  export HOME="$TMP/home"
+  export XDG_DATA_HOME="$HOME/.local/share"
+  export CODEX_DEV_PROJECTS_ROOT="$TMP/projects"
+  export PODMAN_LOG="$TMP/podman-run.log"
+  mkdir -p "$HOME" "$XDG_DATA_HOME" "$CODEX_DEV_PROJECTS_ROOT/app-one/.codex-dev"
+  printf 'PROFILE=generic\nFEDORA_IMAGE=registry.fedoraproject.org/fedora:latest\nREAD_ONLY_ROOT=yes\nDNF_PACKAGES=""\nBUILD_SCRIPT=""\n' > "$CODEX_DEV_PROJECTS_ROOT/app-one/.codex-dev/project.env"
+  FAKEBIN="$TMP/fakebin"
+  mkdir -p "$FAKEBIN"
+  cat > "$FAKEBIN/podman" <<'PODMAN'
+#!/usr/bin/env bash
+case "${1:-}" in
+  info)
+    if [[ "${2:-}" == "--format" ]]; then printf 'true\n'; exit 0; fi
+    exit 0
+    ;;
+  image)
+    if [[ "${2:-}" == "exists" ]]; then exit 0; fi
+    ;;
+  container)
+    if [[ "${2:-}" == "exists" ]]; then exit 1; fi
+    ;;
+  run)
+    printf '%q ' "$@" > "${PODMAN_LOG:?}"
+    printf '\n' >> "${PODMAN_LOG:?}"
+    exit 0
+    ;;
+esac
+printf 'unexpected podman call: %s\n' "$*" >&2
+exit 1
+PODMAN
+  chmod +x "$FAKEBIN/podman"
   export PATH="$FAKEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }
 
@@ -165,7 +209,7 @@ else
 fi
 
 out="$(run_complete --current 2 -- codex-dev '')"
-for c in setup init profiles list config edit edit-build-script build shell codex enter exec doctor volumes reset-cache reset-home nuke-env uninstall completion; do
+for c in setup init profiles list config edit edit-build-script build shell omx codex enter exec doctor volumes reset-cache reset-home nuke-env uninstall completion; do
   assert_contains "$out" "$c" "top-level completion includes $c"
 done
 
@@ -173,7 +217,7 @@ out="$(run_complete --current 2 -- codex-dev sh)"
 assert_contains "$out" 'shell' 'prefix completion includes shell'
 assert_not_contains "$out" 'setup' 'prefix completion filters nonmatching commands'
 
-for cmd in shell build config edit volumes reset-cache reset-home nuke-env; do
+for cmd in shell omx build config edit volumes reset-cache reset-home nuke-env; do
   out="$(run_complete --current 3 -- codex-dev "$cmd" '')"
   assert_contains "$out" 'app-one' "$cmd project completion includes app-one"
   assert_contains "$out" 'api_two' "$cmd project completion includes api_two"
@@ -192,6 +236,11 @@ out="$(run_complete --current 4 -- codex-dev shell app-one '')"
 assert_contains "$out" '--rw-root' 'shell post-project suggests --rw-root'
 assert_not_contains "$out" 'api_two' 'shell post-project does not suggest project names'
 
+out="$(run_complete --current 4 -- codex-dev omx app-one '')"
+assert_has_line "$out" '--rw-root' 'omx post-project suggests --rw-root'
+assert_lacks_line "$out" '--' 'omx post-project does not suggest passthrough separator'
+assert_not_contains "$out" 'api_two' 'omx post-project does not suggest project names'
+
 out="$(run_complete --current 4 -- codex-dev codex app-one '')"
 assert_contains "$out" '--rw-root' 'codex post-project suggests --rw-root'
 assert_contains "$out" '--' 'codex post-project suggests --'
@@ -204,6 +253,21 @@ if [[ -z "$out" ]]; then ok 'exec free-text position has no forced suggestions';
 [[ ! -e "$PODMAN_INVOKED_MARKER" ]] && ok 'completion did not invoke podman' || fail 'completion invoked podman'
 [[ ! -e "$TMP/pwned" ]] && ok 'completion did not source project.env' || fail 'completion sourced project.env'
 
+make_runtime_env
+"$CODEX_DEV" omx app-one
+runtime_log="$(cat "$PODMAN_LOG")"
+assert_contains "$runtime_log" '--workdir /workspace' 'omx runtime uses /workspace workdir'
+assert_contains "$runtime_log" 'omx --madmax --high' 'omx runtime executes fixed madmax high command'
+assert_not_contains "$runtime_log" 'codex --cd' 'omx runtime does not invoke codex command'
+rm -f "$PODMAN_LOG"
+if "$CODEX_DEV" omx app-one -- foo >/tmp/codex-dev-omx-extra.out 2>/tmp/codex-dev-omx-extra.err; then
+  fail 'omx rejects extra args'
+else
+  ok 'omx rejects extra args'
+fi
+[[ ! -e "$PODMAN_LOG" ]] && ok 'omx extra-arg rejection happens before podman' || fail 'omx extra-arg rejection invoked podman'
+
+make_env
 list_out="$($CODEX_DEV list)"
 assert_contains "$list_out" 'app-one' 'list includes app-one'
 assert_contains "$list_out" 'api_two' 'list includes api_two'

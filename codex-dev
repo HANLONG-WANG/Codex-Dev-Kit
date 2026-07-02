@@ -43,6 +43,7 @@ Usage:
   codex-dev edit-build-script <project>
   codex-dev build <project>
   codex-dev shell <project> [--rw-root]
+  codex-dev omx <project> [--rw-root]
   codex-dev codex <project> [--rw-root] [-- <extra codex args...>]
   codex-dev enter <project> [--rw-root] [-- <extra codex args...>]
   codex-dev exec <project> [--rw-root] -- <prompt>
@@ -303,6 +304,7 @@ edit
 edit-build-script
 build
 shell
+omx
 codex
 enter
 exec
@@ -692,10 +694,10 @@ complete_cmd_internal() {
         emit_matching_candidates "$cur" "${candidates[@]}"
       fi
       ;;
-    config|edit|edit-build-script|build|shell|codex|enter|exec|doctor|volumes|reset-cache|reset-home|nuke-env)
+    config|edit|edit-build-script|build|shell|omx|codex|enter|exec|doctor|volumes|reset-cache|reset-home|nuke-env)
       if [[ "$current" -eq 3 ]]; then
         managed_project_names | emit_matching_lines "$cur"
-      elif [[ "$cmd" == "shell" && "$current" -ge 4 ]]; then
+      elif [[ "$cmd" == "shell" || "$cmd" == "omx" ]] && [[ "$current" -ge 4 ]]; then
         if ! word_present_after_project "--rw-root" 3 "${words[@]}"; then
           emit_matching_candidates "$cur" "--rw-root"
         fi
@@ -961,6 +963,13 @@ shell_cmd() {
   parse_rw_flag "$@"
   [[ "${#REMAINING_ARGS[@]}" -eq 0 ]] || die "codex-dev shell only accepts --rw-root after the project name."
   run_container "$name" "$RW_ROOT" /bin/bash -l
+}
+
+omx_cmd() {
+  local name="$1"; shift || true
+  parse_rw_flag "$@"
+  [[ "${#REMAINING_ARGS[@]}" -eq 0 ]] || die "codex-dev omx only accepts --rw-root after the project name."
+  run_container "$name" "$RW_ROOT" omx --madmax --high
 }
 
 codex_cmd() {
@@ -1461,6 +1470,7 @@ main() {
     edit-build-script) [[ $# -eq 1 ]] || die "Usage: codex-dev edit-build-script <project>"; edit_build_script_cmd "$1" ;;
     build) [[ $# -eq 1 ]] || die "Usage: codex-dev build <project>"; build_cmd "$1" ;;
     shell) [[ $# -ge 1 ]] || die "Usage: codex-dev shell <project> [--rw-root]"; shell_cmd "$@" ;;
+    omx) [[ $# -ge 1 ]] || die "Usage: codex-dev omx <project> [--rw-root]"; omx_cmd "$@" ;;
     codex|enter) [[ $# -ge 1 ]] || die "Usage: codex-dev codex <project> [--rw-root] [-- <extra codex args...>]"; codex_cmd "$@" ;;
     exec) [[ $# -ge 2 ]] || die "Usage: codex-dev exec <project> [--rw-root] -- <prompt>"; exec_cmd "$@" ;;
     doctor) doctor_cmd "$@" ;;

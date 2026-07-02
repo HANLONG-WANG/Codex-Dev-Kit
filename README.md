@@ -45,9 +45,11 @@ codex-dev uninstall
 codex-dev init my-app python
 codex-dev build my-app
 codex-dev enter my-app
+# or start OMX directly inside /workspace
+codex-dev omx my-app
 ```
 
-Inside the first Codex session, sign in. Codex state is stored in a per-project Podman named volume, not in your host `~/.codex`.
+Inside the first Codex/OMX session, sign in. Codex state is stored in a per-project Podman named volume, not in your host `~/.codex`.
 
 ## Change dependencies
 
@@ -126,6 +128,7 @@ codex-dev edit <project>
 codex-dev edit-build-script <project>
 codex-dev build <project>
 codex-dev shell <project> [--rw-root]
+codex-dev omx <project> [--rw-root]
 codex-dev codex <project> [--rw-root] [-- <extra codex args...>]
 codex-dev enter <project> [--rw-root] [-- <extra codex args...>]
 codex-dev exec <project> [--rw-root] -- <prompt>
@@ -149,6 +152,7 @@ After `./install.sh`, a new Zsh can complete:
 - managed project names: `codex-dev shell <TAB>`
 - profiles: `codex-dev init demo <TAB>`
 - known flags: `codex-dev shell demo <TAB>` -> `--rw-root`
+- OMX shortcut: `codex-dev omx demo` runs `omx --madmax --high` inside the project container at `/workspace`
 
 Completion uses `codex-dev __complete` internally. It only reads command-line words and shallow project metadata; it does not call Podman, does not source `.codex-dev/project.env`, does not run build scripts, and does not access the network.
 
