@@ -14,7 +14,7 @@
 - Project directories are mounted with Podman's SELinux private label option `:Z`.
 - Project config is declarative and cannot add mounts or container runtime arguments.
 - Image/container/volume names include a short hash of the project name to avoid collisions such as `App` vs `app`.
-- Before `build`/`enter`/`shell`, the tool refuses projects containing sockets, FIFOs, device files, nested mount points, or hardlinked files. Hardlink checks can be bypassed with `CODEX_DEV_ALLOW_HARDLINKS=1` only after manual audit.
+- Before `build`/`codex`/`shell`, the tool refuses projects containing sockets, FIFOs, device files, nested mount points, or hardlinked files. Hardlink checks can be bypassed with `CODEX_DEV_ALLOW_HARDLINKS=1` only after manual audit.
 
 ## Install
 
@@ -46,7 +46,7 @@ codex-dev uninstall
 ```bash
 codex-dev init my-app python
 codex-dev build my-app
-codex-dev enter my-app
+codex-dev codex my-app
 # or start OMX directly inside /workspace
 codex-dev omx my-app
 ```
@@ -75,10 +75,10 @@ Then rebuild:
 
 ```bash
 codex-dev build my-app
-codex-dev enter my-app
+codex-dev codex my-app
 ```
 
-Rebuilds do not create or delete project volumes. Existing volumes such as `codex-dev-home-<resource-id>` and `codex-dev-cache-<resource-id>` are reused by `enter`/`shell` and are not touched by `build`. Therefore changing `project.env` and rebuilding should not produce a “volume already exists” failure. Reset commands now report absent volumes accurately and fail if a volume cannot be removed because a running container is using it.
+Rebuilds do not create or delete project volumes. Existing volumes such as `codex-dev-home-<resource-id>` and `codex-dev-cache-<resource-id>` are reused by `codex`/`shell` and are not touched by `build`. Therefore changing `project.env` and rebuilding should not produce a “volume already exists” failure. Reset commands now report absent volumes accurately and fail if a volume cannot be removed because a running container is using it.
 
 ## `project.env` syntax
 
@@ -125,6 +125,7 @@ codex-dev setup
 codex-dev init <project> [profile]
 codex-dev profiles
 codex-dev list
+codex-dev list -a
 codex-dev config <project>
 codex-dev edit <project>
 codex-dev edit-build-script <project>
@@ -132,8 +133,8 @@ codex-dev build <project>
 codex-dev shell <project> [--rw-root]
 codex-dev omx <project> [--rw-root]
 codex-dev codex <project> [--rw-root] [-- <extra codex args...>]
-codex-dev enter <project> [--rw-root] [-- <extra codex args...>]
 codex-dev exec <project> [--rw-root] -- <prompt>
+codex-dev attach <shell|omx|codex|exec> <project> [...]
 codex-dev doctor [project]
 codex-dev volumes <project>
 codex-dev reset-cache <project>
@@ -142,6 +143,10 @@ codex-dev nuke-env <project>
 codex-dev uninstall
 codex-dev completion zsh [--command <absolute-path>]
 ```
+
+`codex-dev list` is read-only and shows projects with existing build records plus their container status. `codex-dev list -a` is also read-only and additionally scans direct children of `${CODEX_DEV_PROJECTS_ROOT:-~/Projects}` for initialized projects (`.codex-dev/project.env`).
+
+`codex-dev attach <shell|omx|codex|exec> ...` opens another host terminal attached to the same running project container and runs the matching command there. If the project container is not running, it falls back to the normal command flow in the current terminal. Set `CODEX_DEV_TERMINAL` to choose the terminal launcher explicitly.
 
 ## Zsh completion
 

@@ -113,6 +113,89 @@ PODMAN
   export PATH="$FAKEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }
 
+make_attach_env() {
+  TMP="$(mktemp -d)"
+  export HOME="$TMP/home"
+  export XDG_DATA_HOME="$HOME/.local/share"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export CODEX_DEV_PROJECTS_ROOT="$TMP/projects"
+  export PODMAN_LOG="$TMP/podman.log"
+  export TERMINAL_LOG="$TMP/terminal.log"
+  mkdir -p "$HOME" "$XDG_DATA_HOME" "$CODEX_DEV_PROJECTS_ROOT/app-one/.codex-dev"
+  printf 'PROFILE=generic\nFEDORA_IMAGE=registry.fedoraproject.org/fedora:latest\nREAD_ONLY_ROOT=yes\nDNF_PACKAGES=""\nBUILD_SCRIPT=""\n' > "$CODEX_DEV_PROJECTS_ROOT/app-one/.codex-dev/project.env"
+  FAKEBIN="$TMP/fakebin"
+  mkdir -p "$FAKEBIN"
+  cat > "$FAKEBIN/podman" <<'PODMAN'
+#!/usr/bin/env bash
+echo "podman $*" >> "${PODMAN_LOG:?}"
+case "${1:-}" in
+  info)
+    if [[ "${2:-}" == "--format" ]]; then printf 'true\n'; exit 0; fi
+    exit 0
+    ;;
+  container)
+    if [[ "${2:-}" == "exists" ]]; then
+      [[ "${PODMAN_CONTAINER_EXISTS:-0}" == "1" ]] && exit 0 || exit 1
+    fi
+    ;;
+  inspect)
+    printf '%s\n' "${PODMAN_CONTAINER_STATUS:-running}"
+    exit 0
+    ;;
+  image)
+    if [[ "${2:-}" == "exists" ]]; then exit 0; fi
+    ;;
+  run)
+    exit 0
+    ;;
+esac
+exit 0
+PODMAN
+  chmod +x "$FAKEBIN/podman"
+  cat > "$FAKEBIN/fake-terminal" <<'TERM'
+#!/usr/bin/env bash
+printf '%q ' "$@" > "${TERMINAL_LOG:?}"
+printf '\n' >> "${TERMINAL_LOG:?}"
+TERM
+  chmod +x "$FAKEBIN/fake-terminal"
+  export CODEX_DEV_TERMINAL="$FAKEBIN/fake-terminal"
+  export PATH="$FAKEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
+make_nuke_env() {
+  TMP="$(mktemp -d)"
+  export HOME="$TMP/home"
+  export XDG_DATA_HOME="$HOME/.local/share"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export CODEX_DEV_PROJECTS_ROOT="$TMP/projects"
+  export PODMAN_LOG="$TMP/podman-nuke.log"
+  mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME/codex-dev/build" "$CODEX_DEV_PROJECTS_ROOT/app-one/.codex-dev"
+  printf 'PROFILE=generic\n' > "$CODEX_DEV_PROJECTS_ROOT/app-one/.codex-dev/project.env"
+  FAKEBIN="$TMP/fakebin"
+  mkdir -p "$FAKEBIN"
+  cat > "$FAKEBIN/podman" <<'PODMAN'
+#!/usr/bin/env bash
+echo "podman $*" >> "${PODMAN_LOG:?}"
+case "${1:-}" in
+  info)
+    if [[ "${2:-}" == "--format" ]]; then printf 'true\n'; exit 0; fi
+    exit 0
+    ;;
+  container|image|volume)
+    if [[ "${2:-}" == "exists" ]]; then exit 1; fi
+    if [[ "$1" == "image" && "${2:-}" == "rm" ]]; then exit 0; fi
+    if [[ "$1" == "volume" && "${2:-}" == "rm" ]]; then exit 0; fi
+    ;;
+  rm)
+    exit 0
+    ;;
+esac
+exit 0
+PODMAN
+  chmod +x "$FAKEBIN/podman"
+  export PATH="$FAKEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
 run_complete() {
   "$CODEX_DEV" __complete "$@"
 }
@@ -209,9 +292,10 @@ else
 fi
 
 out="$(run_complete --current 2 -- codex-dev '')"
-for c in setup init profiles list config edit edit-build-script build shell omx codex enter exec doctor volumes reset-cache reset-home nuke-env uninstall completion; do
+for c in setup init profiles list config edit edit-build-script build shell omx codex exec attach doctor volumes reset-cache reset-home nuke-env uninstall completion; do
   assert_contains "$out" "$c" "top-level completion includes $c"
 done
+assert_not_contains "$out" 'enter' 'top-level completion excludes removed enter'
 
 out="$(run_complete --current 2 -- codex-dev sh)"
 assert_contains "$out" 'shell' 'prefix completion includes shell'
@@ -244,11 +328,22 @@ assert_not_contains "$out" 'api_two' 'omx post-project does not suggest project 
 out="$(run_complete --current 4 -- codex-dev codex app-one '')"
 assert_contains "$out" '--rw-root' 'codex post-project suggests --rw-root'
 assert_contains "$out" '--' 'codex post-project suggests --'
-out="$(run_complete --current 4 -- codex-dev enter app-one '')"
-assert_contains "$out" '--rw-root' 'enter post-project suggests --rw-root'
-assert_contains "$out" '--' 'enter post-project suggests --'
 out="$(run_complete --current 5 -- codex-dev exec app-one -- '')"
 if [[ -z "$out" ]]; then ok 'exec free-text position has no forced suggestions'; else fail "exec free-text position expected no output, got: $out"; fi
+
+out="$(run_complete --current 3 -- codex-dev attach '')"
+for sub in shell omx codex exec; do
+  assert_contains "$out" "$sub" "attach subcommand completion includes $sub"
+done
+out="$(run_complete --current 4 -- codex-dev attach shell '')"
+assert_contains "$out" 'app-one' 'attach shell project completion includes app-one'
+assert_contains "$out" 'api_two' 'attach shell project completion includes api_two'
+out="$(run_complete --current 5 -- codex-dev attach shell app-one '')"
+assert_has_line "$out" '--rw-root' 'attach shell post-project suggests --rw-root'
+assert_lacks_line "$out" '--' 'attach shell post-project does not suggest --'
+out="$(run_complete --current 5 -- codex-dev attach codex app-one '')"
+assert_contains "$out" '--rw-root' 'attach codex post-project suggests --rw-root'
+assert_contains "$out" '--' 'attach codex post-project suggests --'
 
 [[ ! -e "$PODMAN_INVOKED_MARKER" ]] && ok 'completion did not invoke podman' || fail 'completion invoked podman'
 [[ ! -e "$TMP/pwned" ]] && ok 'completion did not source project.env' || fail 'completion sourced project.env'
@@ -269,13 +364,102 @@ fi
 
 make_env
 list_out="$($CODEX_DEV list)"
-assert_contains "$list_out" 'app-one' 'list includes app-one'
-assert_contains "$list_out" 'api_two' 'list includes api_two'
-assert_not_contains "$list_out" 'bad name' 'list excludes invalid names via shared helper'
-assert_not_contains "$list_out" 'linkproj' 'list excludes symlinked project dir via shared helper'
-assert_not_contains "$list_out" 'linkmeta' 'list excludes symlinked .codex-dev via shared helper'
-assert_not_contains "$list_out" 'linkcfg' 'list excludes symlinked project.env via shared helper'
+assert_not_contains "$list_out" 'app-one' 'plain list excludes initialized-only app-one'
+assert_not_contains "$list_out" 'api_two' 'plain list excludes initialized-only api_two'
+rid="$(resource_id_for_test app-one)"
+build_dir="$HOME/.config/codex-dev/build/$rid"
+mkdir -p "$build_dir"
+printf '# Generated by codex-dev. Do not edit this file directly.\n# Edit %s/app-one/.codex-dev/project.env and run: codex-dev build app-one\n' "$CODEX_DEV_PROJECTS_ROOT" > "$build_dir/Containerfile"
+rm -f "$PODMAN_INVOKED_MARKER"
+list_out="$($CODEX_DEV list)"
+assert_contains "$list_out" 'app-one' 'plain list includes built app-one from build record'
+assert_contains "$list_out" 'not-present' 'plain list includes container runtime status'
+assert_contains "$list_out" 'localhost/codex-dev/app-one-' 'plain list includes built image name'
+assert_not_contains "$list_out" 'api_two' 'plain list still excludes initialized-only api_two'
+[[ -e "$PODMAN_INVOKED_MARKER" ]] && ok 'plain list probes podman for built runtime status' || fail 'plain list did not probe podman status for built project'
+list_all_out="$($CODEX_DEV list -a)"
+assert_contains "$list_all_out" 'app-one' 'list -a includes built app-one'
+assert_contains "$list_all_out" '已build' 'list -a marks built state'
+assert_contains "$list_all_out" 'api_two' 'list -a includes initialized api_two'
+assert_contains "$list_all_out" '已init' 'list -a marks initialized state'
+assert_contains "$list_all_out" 'container=codex-dev-app-one-' 'list -a includes built container resource'
+assert_contains "$list_all_out" 'volumes=codex-dev-home-app-one-' 'list -a includes built volume resources'
+assert_not_contains "$list_all_out" 'bad name' 'list -a excludes invalid names via shared helper'
+assert_not_contains "$list_all_out" 'linkproj' 'list -a excludes symlinked project dir via shared helper'
+assert_not_contains "$list_all_out" 'linkmeta' 'list -a excludes symlinked .codex-dev via shared helper'
+assert_not_contains "$list_all_out" 'linkcfg' 'list -a excludes symlinked project.env via shared helper'
 
+make_env
+rm -rf "$HOME/.config" "$CODEX_DEV_PROJECTS_ROOT"
+list_empty_out="$($CODEX_DEV list 2>&1)"
+assert_contains "$list_empty_out" 'No built projects' 'plain list is read-only and tolerates absent config/projects roots'
+
+make_nuke_env
+rid="$(resource_id_for_test app-one)"
+mkdir -p "$XDG_CONFIG_HOME/codex-dev/build/$rid"
+nuke_out="$($CODEX_DEV nuke-env app-one 2>&1)"
+assert_contains "$nuke_out" 'Removed build directory:' 'nuke-env reports removed build directory'
+assert_dir_not_exists "$XDG_CONFIG_HOME/codex-dev/build/$rid" 'nuke-env removes build directory'
+nuke_out="$($CODEX_DEV nuke-env app-one 2>&1)"
+assert_contains "$nuke_out" 'Build directory not present:' 'nuke-env reports missing build directory on second run'
+
+make_nuke_env
+rid="$(resource_id_for_test app-one)"
+rm -rf "$XDG_CONFIG_HOME/codex-dev"
+mkdir -p "$TMP/config-real/codex-dev/build/$rid"
+ln -s "$TMP/config-real/codex-dev" "$XDG_CONFIG_HOME/codex-dev"
+if "$CODEX_DEV" nuke-env app-one >/tmp/codex-dev-nuke-symlink-parent.out 2>/tmp/codex-dev-nuke-symlink-parent.err; then
+  fail 'nuke-env refuses build cleanup through symlinked parent'
+else
+  ok 'nuke-env refuses build cleanup through symlinked parent'
+fi
+assert_contains "$(cat /tmp/codex-dev-nuke-symlink-parent.err)" 'Refusing to remove build directory through symlinked parent' 'nuke-env explains symlinked parent refusal'
+assert_dir_exists "$TMP/config-real/codex-dev/build/$rid" 'nuke-env preserves build dir through symlinked parent'
+
+make_attach_env
+if "$CODEX_DEV" attach shell app-one unexpected >/tmp/codex-dev-attach-invalid-shell.out 2>/tmp/codex-dev-attach-invalid-shell.err; then
+  fail 'attach shell rejects extra args'
+else
+  ok 'attach shell rejects extra args'
+fi
+[[ ! -e "$PODMAN_LOG" && ! -e "$TERMINAL_LOG" ]] && ok 'attach shell validation happens before podman/terminal' || fail 'attach shell invalid invoked podman/terminal'
+if "$CODEX_DEV" attach omx app-one -- foo >/tmp/codex-dev-attach-invalid-omx.out 2>/tmp/codex-dev-attach-invalid-omx.err; then
+  fail 'attach omx rejects extra args'
+else
+  ok 'attach omx rejects extra args'
+fi
+if "$CODEX_DEV" attach exec app-one >/tmp/codex-dev-attach-invalid-exec.out 2>/tmp/codex-dev-attach-invalid-exec.err; then
+  fail 'attach exec requires prompt'
+else
+  ok 'attach exec requires prompt'
+fi
+if "$CODEX_DEV" attach bad app-one >/tmp/codex-dev-attach-invalid-sub.out 2>/tmp/codex-dev-attach-invalid-sub.err; then
+  fail 'attach rejects invalid subcommand'
+else
+  ok 'attach rejects invalid subcommand'
+fi
+rm -f "$PODMAN_LOG" "$TERMINAL_LOG"
+export PODMAN_CONTAINER_EXISTS=1 PODMAN_CONTAINER_STATUS=running
+"$CODEX_DEV" attach codex app-one -- --model test-model
+terminal_log="$(cat "$TERMINAL_LOG")"
+assert_contains "$terminal_log" 'podman\ exec\ -it\ codex-dev-app-one-' 'attach running launches podman exec in terminal'
+assert_contains "$terminal_log" '--model\ test-model' 'attach codex preserves passthrough args'
+rm -f "$PODMAN_LOG" "$TERMINAL_LOG"
+export PODMAN_CONTAINER_STATUS=paused
+if "$CODEX_DEV" attach shell app-one >/tmp/codex-dev-attach-paused.out 2>/tmp/codex-dev-attach-paused.err; then
+  fail 'attach paused container fails'
+else
+  ok 'attach paused container fails'
+fi
+[[ ! -e "$TERMINAL_LOG" ]] && ok 'attach paused does not launch terminal' || fail 'attach paused launched terminal'
+rm -f "$PODMAN_LOG" "$TERMINAL_LOG"
+export PODMAN_CONTAINER_EXISTS=0
+"$CODEX_DEV" attach omx app-one
+fallback_log="$(cat "$PODMAN_LOG")"
+assert_contains "$fallback_log" 'podman run' 'attach missing container falls back to normal run_container flow'
+assert_not_contains "$(cat "$TERMINAL_LOG" 2>/dev/null || true)" 'podman' 'attach missing container does not launch terminal'
+
+make_env
 if command -v zsh >/dev/null 2>&1; then
   zfunc="$TMP/zfunc"
   mkdir -p "$zfunc"
@@ -308,6 +492,8 @@ assert_file_exists "$completion_file" 'installer writes zsh completion file'
 assert_file_contains "$completion_file" "$installed_bin" 'installed completion embeds installed binary path'
 assert_file_exists "$snippet_file" 'installer writes zsh snippet'
 assert_file_contains "$HOME/.zshrc" 'codex-dev zsh completion' 'installer creates marker in absent .zshrc'
+assert_not_contains "$(cat "$TMP/install.out" "$TMP/install.err")" 'codex-dev enter demo' 'installer next steps exclude removed enter'
+assert_contains "$(cat "$TMP/install.out" "$TMP/install.err")" 'codex-dev codex demo' 'installer next steps use codex command'
 ( cd "$ROOT" && "$INSTALL" ) > "$TMP/install2.out" 2> "$TMP/install2.err"
 marker_count="$(grep -c 'BEGIN codex-dev zsh completion' "$HOME/.zshrc" || true)"
 [[ "$marker_count" == "1" ]] && ok 'installer marker is idempotent' || fail "installer marker duplicated: $marker_count"
@@ -414,6 +600,13 @@ assert_contains "$profiles_out" 'python' 'profiles still lists python'
 help_out="$($CODEX_DEV --help)"
 assert_contains "$help_out" 'codex-dev shell <project>' 'help still works'
 assert_contains "$help_out" 'codex-dev uninstall' 'help includes uninstall'
+assert_contains "$help_out" 'codex-dev attach <shell|omx|codex|exec>' 'help includes attach'
+assert_not_contains "$help_out" 'codex-dev enter' 'help excludes removed enter'
+if "$CODEX_DEV" enter app-one >/tmp/codex-dev-enter.out 2>/tmp/codex-dev-enter.err; then
+  fail 'removed enter command should fail'
+else
+  ok 'removed enter command fails'
+fi
 
 # Uninstall abort path: final confirmation refuses all changes after plan output.
 make_uninstall_env

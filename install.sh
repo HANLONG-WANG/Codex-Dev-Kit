@@ -253,7 +253,7 @@ Next steps:
   4. Create a project:
        codex-dev init demo python
        codex-dev build demo
-       codex-dev enter demo
+       codex-dev codex demo
 MSG
 
 if [[ "$ZSH_RC_STATUS" == manual* ]]; then

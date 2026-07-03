@@ -45,8 +45,8 @@ Usage:
   codex-dev shell <project> [--rw-root]
   codex-dev omx <project> [--rw-root]
   codex-dev codex <project> [--rw-root] [-- <extra codex args...>]
-  codex-dev enter <project> [--rw-root] [-- <extra codex args...>]
   codex-dev exec <project> [--rw-root] -- <prompt>
+  codex-dev attach <shell|omx|codex|exec> <project> [...]
   codex-dev doctor [project]
   codex-dev volumes <project>
   codex-dev reset-cache <project>
@@ -306,8 +306,8 @@ build
 shell
 omx
 codex
-enter
 exec
+attach
 doctor
 volumes
 reset-cache
@@ -615,18 +615,173 @@ EOF_CFG
 }
 
 list_cmd() {
-  ensure_setup_dirs
-  need_cmd realpath
+  local show_all="no"
+  case "$#" in
+    0) ;;
+    1)
+      [[ "${1:-}" == "-a" ]] || die "Usage: codex-dev list [-a]"
+      show_all="yes"
+      ;;
+    *) die "Usage: codex-dev list [-a]" ;;
+  esac
+
+  validate_host_path_string "Build root" "$BUILD_ROOT"
+  validate_image_prefix
   need_cmd sha256sum
-  ensure_projects_root_safe
-  local found=0 name img
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    img="$(image_name "$name")"
-    printf '%-28s  %-8s  %s\n' "$name" "managed" "$img"
+
+  if [[ "$show_all" == "yes" ]]; then
+    list_all_projects
+  else
+    list_built_projects
+  fi
+}
+
+image_name_from_resource_id() {
+  local rid="$1"
+  printf '%s/%s:latest' "$IMAGE_PREFIX" "$rid"
+}
+
+container_name_from_resource_id() {
+  local rid="$1"
+  printf '%s-%s' "$CONTAINER_PREFIX" "$rid"
+}
+
+volume_name_from_resource_id() {
+  local kind="$1" rid="$2"
+  printf '%s-%s-%s' "$CONTAINER_PREFIX" "$kind" "$rid"
+}
+
+volume_names_from_resource_id() {
+  local rid="$1" kind first=1
+  for kind in home cache npm cargo gradle go; do
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+    else
+      printf ','
+    fi
+    volume_name_from_resource_id "$kind" "$rid"
+  done
+}
+
+container_status_by_resource_id() {
+  local rid="$1" cname status
+  cname="$(container_name_from_resource_id "$rid")"
+  if ! command -v podman >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  if podman container exists "$cname" >/dev/null 2>&1; then
+    status="$(podman inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || printf 'unknown')"
+    printf '%s' "${status:-unknown}"
+  else
+    printf 'not-present'
+  fi
+}
+
+build_record_name_from_containerfile() {
+  local rid="$1" cf line
+  cf="$BUILD_ROOT/$rid/Containerfile"
+  [[ -f "$cf" && ! -L "$cf" ]] || return 1
+  line="$(grep -E '^# Edit .+ and run: codex-dev build [A-Za-z0-9._-]+$' "$cf" 2>/dev/null | head -n 1 || true)"
+  [[ -n "$line" ]] || return 1
+  line="${line##* and run: codex-dev build }"
+  valid_project_name "$line" || return 1
+  printf '%s' "$line"
+}
+
+build_record_project_path_from_containerfile() {
+  local rid="$1" cf line cfg project
+  cf="$BUILD_ROOT/$rid/Containerfile"
+  [[ -f "$cf" && ! -L "$cf" ]] || return 1
+  line="$(grep -E '^# Edit .+ and run: codex-dev build [A-Za-z0-9._-]+$' "$cf" 2>/dev/null | head -n 1 || true)"
+  [[ -n "$line" ]] || return 1
+  cfg="${line#"# Edit "}"
+  cfg="${cfg% and run: codex-dev build *}"
+  [[ "$cfg" == */.codex-dev/project.env ]] || return 1
+  project="${cfg%/.codex-dev/project.env}"
+  [[ -n "$project" ]] || return 1
+  printf '%s' "$project"
+}
+
+build_record_resource_ids() {
+  local d rid nullglob_was_set=0
+  [[ -d "$BUILD_ROOT" && ! -L "$BUILD_ROOT" ]] || return 0
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -s nullglob
+  for d in "$BUILD_ROOT"/*; do
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    rid="$(basename "$d")"
+    [[ "$rid" =~ ^[A-Za-z0-9_.-]+-[0-9a-f]{10}$ ]] || continue
+    printf '%s\n' "$rid"
+  done
+  if [[ "$nullglob_was_set" -eq 1 ]]; then
+    shopt -s nullglob
+  else
+    shopt -u nullglob
+  fi
+}
+
+list_built_projects() {
+  local found=0 rid name path status img
+  while IFS= read -r rid; do
+    [[ -n "$rid" ]] || continue
+    name="$(build_record_name_from_containerfile "$rid" 2>/dev/null || printf '%s' "$rid")"
+    path="$(build_record_project_path_from_containerfile "$rid" 2>/dev/null || printf '%s' "$BUILD_ROOT/$rid")"
+    status="$(container_status_by_resource_id "$rid")"
+    img="$(image_name_from_resource_id "$rid")"
+    printf '%-28s  %-12s  %s  %s\n' "$name" "$status" "$img" "$path"
     found=1
+  done < <(build_record_resource_ids)
+  [[ "$found" -eq 1 ]] || log "No built projects under $BUILD_ROOT"
+}
+
+list_all_projects() {
+  local rid name path status img cname vols project_name project_rid
+  declare -A row_name=() row_path=() row_state=()
+
+  while IFS= read -r rid; do
+    [[ -n "$rid" ]] || continue
+    name="$(build_record_name_from_containerfile "$rid" 2>/dev/null || printf '%s' "$rid")"
+    path="$(build_record_project_path_from_containerfile "$rid" 2>/dev/null || printf '%s' "$BUILD_ROOT/$rid")"
+    row_name["$rid"]="$name"
+    row_path["$rid"]="$path"
+    row_state["$rid"]="已build"
+  done < <(build_record_resource_ids)
+
+  while IFS= read -r project_name; do
+    [[ -n "$project_name" ]] || continue
+    project_rid="$(resource_id "$project_name")"
+    if [[ -n "${row_state[$project_rid]:-}" ]]; then
+      [[ "${row_name[$project_rid]}" == "$project_rid" ]] && row_name["$project_rid"]="$project_name"
+      row_path["$project_rid"]="$(project_path_literal "$project_name")"
+      row_state["$project_rid"]="已build"
+    else
+      row_name["$project_rid"]="$project_name"
+      row_path["$project_rid"]="$(project_path_literal "$project_name")"
+      row_state["$project_rid"]="已init"
+    fi
   done < <(managed_project_names)
-  [[ "$found" -eq 1 ]] || log "No managed projects under $PROJECTS_ROOT"
+
+  if [[ "${#row_name[@]}" -eq 0 ]]; then
+    log "No initialized or built projects found."
+    return 0
+  fi
+
+  for rid in "${!row_name[@]}"; do
+    if [[ "${row_state[$rid]}" == "已build" ]]; then
+      status="$(container_status_by_resource_id "$rid")"
+      cname="$(container_name_from_resource_id "$rid")"
+      img="$(image_name_from_resource_id "$rid")"
+      vols="$(volume_names_from_resource_id "$rid")"
+    else
+      status="-"
+      cname="-"
+      img="-"
+      vols="-"
+    fi
+    printf '%-28s  %-40s  %-8s  status=%s  container=%s  image=%s  volumes=%s\n' \
+      "${row_name[$rid]}" "${row_path[$rid]}" "${row_state[$rid]}" "$status" "$cname" "$img" "$vols"
+  done | sort
 }
 
 candidate_matches_prefix() {
@@ -694,14 +849,14 @@ complete_cmd_internal() {
         emit_matching_candidates "$cur" "${candidates[@]}"
       fi
       ;;
-    config|edit|edit-build-script|build|shell|omx|codex|enter|exec|doctor|volumes|reset-cache|reset-home|nuke-env)
+    config|edit|edit-build-script|build|shell|omx|codex|exec|doctor|volumes|reset-cache|reset-home|nuke-env)
       if [[ "$current" -eq 3 ]]; then
         managed_project_names | emit_matching_lines "$cur"
       elif [[ "$cmd" == "shell" || "$cmd" == "omx" ]] && [[ "$current" -ge 4 ]]; then
         if ! word_present_after_project "--rw-root" 3 "${words[@]}"; then
           emit_matching_candidates "$cur" "--rw-root"
         fi
-      elif [[ "$cmd" == "codex" || "$cmd" == "enter" || "$cmd" == "exec" ]]; then
+      elif [[ "$cmd" == "codex" || "$cmd" == "exec" ]]; then
         if word_present_after_project "--" 3 "${words[@]}"; then
           return 0
         fi
@@ -709,6 +864,31 @@ complete_cmd_internal() {
         word_present_after_project "--rw-root" 3 "${words[@]}" || candidates+=("--rw-root")
         candidates+=("--")
         emit_matching_candidates "$cur" "${candidates[@]}"
+      fi
+      ;;
+    attach)
+      local attach_sub="${words[2]:-}"
+      if [[ "$current" -eq 3 ]]; then
+        emit_matching_candidates "$cur" shell omx codex exec
+      elif [[ "$current" -eq 4 ]]; then
+        managed_project_names | emit_matching_lines "$cur"
+      elif [[ "$current" -ge 5 ]]; then
+        case "$attach_sub" in
+          shell|omx)
+            if ! word_present_after_project "--rw-root" 4 "${words[@]}"; then
+              emit_matching_candidates "$cur" "--rw-root"
+            fi
+            ;;
+          codex|exec)
+            if word_present_after_project "--" 4 "${words[@]}"; then
+              return 0
+            fi
+            candidates=()
+            word_present_after_project "--rw-root" 4 "${words[@]}" || candidates+=("--rw-root")
+            candidates+=("--")
+            emit_matching_candidates "$cur" "${candidates[@]}"
+            ;;
+        esac
       fi
       ;;
     completion)
@@ -993,6 +1173,119 @@ exec_cmd() {
   run_container "$name" "$RW_ROOT" codex exec --cd /workspace --sandbox danger-full-access --ask-for-approval never "${prompt_args[*]}"
 }
 
+shell_words() {
+  local word
+  for word in "$@"; do
+    printf '%q ' "$word"
+  done
+}
+
+launch_host_terminal() {
+  local command_string terminal base
+  command_string="$(shell_words "$@")"
+  if [[ -n "${CODEX_DEV_TERMINAL:-}" ]]; then
+    # Test/user override. Keep this intentionally simple and deterministic:
+    # CODEX_DEV_TERMINAL may name an executable plus optional simple arguments.
+    # shellcheck disable=SC2206
+    local -a terminal_cmd=( $CODEX_DEV_TERMINAL )
+    [[ "${#terminal_cmd[@]}" -gt 0 ]] || die "CODEX_DEV_TERMINAL is empty."
+    "${terminal_cmd[@]}" -- bash -lc "$command_string" || die "Failed to launch terminal: ${terminal_cmd[*]}"
+    return 0
+  fi
+
+  for terminal in gnome-terminal kgx konsole xfce4-terminal xterm alacritty kitty; do
+    command -v "$terminal" >/dev/null 2>&1 || continue
+    base="$(basename "$terminal")"
+    case "$base" in
+      gnome-terminal|kgx)
+        "$terminal" -- bash -lc "$command_string" || die "Failed to launch terminal: $terminal"
+        ;;
+      konsole|xfce4-terminal|xterm|alacritty|kitty)
+        "$terminal" -e bash -lc "$command_string" || die "Failed to launch terminal: $terminal"
+        ;;
+      *) continue ;;
+    esac
+    return 0
+  done
+  die "No supported terminal launcher found. Set CODEX_DEV_TERMINAL to a terminal command."
+}
+
+attach_or_run() {
+  local name="$1" rw_root="$2" cname state
+  shift 2
+  ensure_podman_rootless
+  need_cmd sha256sum
+  cname="$(container_name "$name")"
+  if podman container exists "$cname"; then
+    state="$(podman inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || printf 'unknown')"
+    case "$state" in
+      running)
+        log "Opening terminal attached to running container: $cname"
+        launch_host_terminal podman exec -it "$cname" "$@"
+        ;;
+      paused)
+        die "Container '$cname' is paused. Unpause or stop it before using codex-dev attach."
+        ;;
+      *)
+        log "Container '$cname' is not running (state: ${state:-unknown}); starting normal '$1' command flow."
+        run_container "$name" "$rw_root" "$@"
+        ;;
+    esac
+  else
+    run_container "$name" "$rw_root" "$@"
+  fi
+}
+
+attach_cmd() {
+  local sub="${1:-}" name
+  [[ -n "$sub" ]] || die "Usage: codex-dev attach <shell|omx|codex|exec> <project> [...]"
+  shift || true
+  case "$sub" in
+    shell)
+      [[ $# -ge 1 ]] || die "Usage: codex-dev attach shell <project> [--rw-root]"
+      name="$1"; shift
+      require_project_name "$name"
+      parse_rw_flag "$@"
+      [[ "${#REMAINING_ARGS[@]}" -eq 0 ]] || die "codex-dev attach shell only accepts --rw-root after the project name."
+      attach_or_run "$name" "$RW_ROOT" /bin/bash -l
+      ;;
+    omx)
+      [[ $# -ge 1 ]] || die "Usage: codex-dev attach omx <project> [--rw-root]"
+      name="$1"; shift
+      require_project_name "$name"
+      parse_rw_flag "$@"
+      [[ "${#REMAINING_ARGS[@]}" -eq 0 ]] || die "codex-dev attach omx only accepts --rw-root after the project name."
+      attach_or_run "$name" "$RW_ROOT" omx --madmax --high
+      ;;
+    codex)
+      [[ $# -ge 1 ]] || die "Usage: codex-dev attach codex <project> [--rw-root] [-- <extra codex args...>]"
+      name="$1"; shift
+      require_project_name "$name"
+      parse_rw_flag "$@"
+      local extra=("${REMAINING_ARGS[@]}")
+      if [[ "${extra[0]:-}" == "--" ]]; then
+        extra=("${extra[@]:1}")
+      fi
+      attach_or_run "$name" "$RW_ROOT" codex --cd /workspace --sandbox danger-full-access --ask-for-approval never "${extra[@]}"
+      ;;
+    exec)
+      [[ $# -ge 1 ]] || die "Usage: codex-dev attach exec <project> [--rw-root] -- <prompt>"
+      name="$1"; shift
+      require_project_name "$name"
+      parse_rw_flag "$@"
+      local prompt_args=("${REMAINING_ARGS[@]}")
+      if [[ "${prompt_args[0]:-}" == "--" ]]; then
+        prompt_args=("${prompt_args[@]:1}")
+      fi
+      [[ "${#prompt_args[@]}" -gt 0 ]] || die "Provide a prompt after --"
+      attach_or_run "$name" "$RW_ROOT" codex exec --cd /workspace --sandbox danger-full-access --ask-for-approval never "${prompt_args[*]}"
+      ;;
+    *)
+      die "Usage: codex-dev attach <shell|omx|codex|exec> <project> [...]"
+      ;;
+  esac
+}
+
 volumes_cmd() {
   local name="$1" kind
   require_project_name "$name"
@@ -1034,10 +1327,11 @@ reset_home_cmd() {
 }
 
 nuke_env_cmd() {
-  local name="$1" img kind vol cname
+  local name="$1" img kind vol cname build_dir
   require_project_name "$name"
   ensure_podman_rootless
   need_cmd sha256sum
+  validate_host_path_string "Build root" "$BUILD_ROOT"
   validate_image_prefix
   img="$(image_name "$name")"
   cname="$(container_name "$name")"
@@ -1057,6 +1351,17 @@ nuke_env_cmd() {
     vol="$(volume_name "$kind" "$name")"
     remove_volume_if_exists "$vol"
   done
+  build_dir="$BUILD_ROOT/$(resource_id "$name")"
+  if [[ -e "$build_dir" || -L "$build_dir" ]] && path_has_symlink_parent "$build_dir"; then
+    die "Refusing to remove build directory through symlinked parent; inspect manually: $build_dir"
+  elif [[ -L "$build_dir" ]]; then
+    die "Refusing to remove symlinked build directory: $build_dir"
+  elif [[ -d "$build_dir" ]]; then
+    rm -rf -- "$build_dir" || die "Failed to remove build directory: $build_dir"
+    log "Removed build directory: $build_dir"
+  else
+    log "Build directory not present: $build_dir"
+  fi
   log "Project directory was not touched: $(project_path_literal "$name")"
 }
 
@@ -1464,15 +1769,16 @@ main() {
     setup) [[ $# -eq 0 ]] || die "Usage: codex-dev setup"; setup_cmd ;;
     init) init_cmd "$@" ;;
     profiles) [[ $# -eq 0 ]] || die "Usage: codex-dev profiles"; print_profiles ;;
-    list) [[ $# -eq 0 ]] || die "Usage: codex-dev list"; list_cmd ;;
+    list) list_cmd "$@" ;;
     config) [[ $# -eq 1 ]] || die "Usage: codex-dev config <project>"; config_cmd "$1" ;;
     edit) [[ $# -eq 1 ]] || die "Usage: codex-dev edit <project>"; edit_cmd "$1" ;;
     edit-build-script) [[ $# -eq 1 ]] || die "Usage: codex-dev edit-build-script <project>"; edit_build_script_cmd "$1" ;;
     build) [[ $# -eq 1 ]] || die "Usage: codex-dev build <project>"; build_cmd "$1" ;;
     shell) [[ $# -ge 1 ]] || die "Usage: codex-dev shell <project> [--rw-root]"; shell_cmd "$@" ;;
     omx) [[ $# -ge 1 ]] || die "Usage: codex-dev omx <project> [--rw-root]"; omx_cmd "$@" ;;
-    codex|enter) [[ $# -ge 1 ]] || die "Usage: codex-dev codex <project> [--rw-root] [-- <extra codex args...>]"; codex_cmd "$@" ;;
+    codex) [[ $# -ge 1 ]] || die "Usage: codex-dev codex <project> [--rw-root] [-- <extra codex args...>]"; codex_cmd "$@" ;;
     exec) [[ $# -ge 2 ]] || die "Usage: codex-dev exec <project> [--rw-root] -- <prompt>"; exec_cmd "$@" ;;
+    attach) attach_cmd "$@" ;;
     doctor) doctor_cmd "$@" ;;
     volumes) [[ $# -eq 1 ]] || die "Usage: codex-dev volumes <project>"; volumes_cmd "$1" ;;
     reset-cache) [[ $# -eq 1 ]] || die "Usage: codex-dev reset-cache <project>"; reset_cache_cmd "$1" ;;

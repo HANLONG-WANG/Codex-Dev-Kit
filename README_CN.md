@@ -14,7 +14,7 @@
 - 项目目录使用 Podman 的 SELinux 私有标签选项 `:Z` 挂载。
 - 项目配置是声明式的，不能添加任意挂载或容器运行参数。
 - 镜像/容器/卷的名称包含项目名的短哈希，以避免 `App` 与 `app` 等名称冲突。
-- 在执行 `build`/`enter`/`shell` 之前，工具会拒绝包含 socket、FIFO、设备文件、嵌套挂载点或硬链接文件的项目。硬链接检查可在人工审计后，通过 `CODEX_DEV_ALLOW_HARDLINKS=1` 绕过。
+- 在执行 `build`/`codex`/`shell` 之前，工具会拒绝包含 socket、FIFO、设备文件、嵌套挂载点或硬链接文件的项目。硬链接检查可在人工审计后，通过 `CODEX_DEV_ALLOW_HARDLINKS=1` 绕过。
 
 ## 安装
 
@@ -46,7 +46,7 @@ codex-dev uninstall
 ```bash
 codex-dev init my-app python
 codex-dev build my-app
-codex-dev enter my-app
+codex-dev codex my-app
 # 或者直接在 /workspace 中启动 OMX
 codex-dev omx my-app
 ```
@@ -75,10 +75,10 @@ BUILD_SCRIPT=""
 
 ```bash
 codex-dev build my-app
-codex-dev enter my-app
+codex-dev codex my-app
 ```
 
-重建不会创建或删除项目卷。`codex-dev-home-<resource-id>` 和 `codex-dev-cache-<resource-id>` 等现有卷会被 `enter`/`shell` 复用，不会被 `build` 影响。因此修改 `project.env` 后重建通常不会出现“卷已存在”错误。重置命令现在会准确报告缺失的卷，并在运行中的容器占用该卷时失败。
+重建不会创建或删除项目卷。`codex-dev-home-<resource-id>` 和 `codex-dev-cache-<resource-id>` 等现有卷会被 `codex`/`shell` 复用，不会被 `build` 影响。因此修改 `project.env` 后重建通常不会出现“卷已存在”错误。重置命令现在会准确报告缺失的卷，并在运行中的容器占用该卷时失败。
 
 ## `project.env` 语法
 
@@ -125,6 +125,7 @@ codex-dev setup
 codex-dev init <project> [profile]
 codex-dev profiles
 codex-dev list
+codex-dev list -a
 codex-dev config <project>
 codex-dev edit <project>
 codex-dev edit-build-script <project>
@@ -132,8 +133,8 @@ codex-dev build <project>
 codex-dev shell <project> [--rw-root]
 codex-dev omx <project> [--rw-root]
 codex-dev codex <project> [--rw-root] [-- <extra codex args...>]
-codex-dev enter <project> [--rw-root] [-- <extra codex args...>]
 codex-dev exec <project> [--rw-root] -- <prompt>
+codex-dev attach <shell|omx|codex|exec> <project> [...]
 codex-dev doctor [project]
 codex-dev volumes <project>
 codex-dev reset-cache <project>
@@ -142,6 +143,10 @@ codex-dev nuke-env <project>
 codex-dev uninstall
 codex-dev completion zsh [--command <absolute-path>]
 ```
+
+`codex-dev list` 是只读操作，会显示已有 build 记录的项目和容器状态。`codex-dev list -a` 也是只读操作，并会额外扫描 `${CODEX_DEV_PROJECTS_ROOT:-~/Projects}` 的直接子目录，通过 `.codex-dev/project.env` 识别已初始化项目。
+
+`codex-dev attach <shell|omx|codex|exec> ...` 会在宿主机再打开一个终端窗口，附着到同一个正在运行的项目容器并执行对应命令。如果项目容器未运行，则退回到当前终端中的普通命令启动流程。可设置 `CODEX_DEV_TERMINAL` 显式选择终端启动器。
 
 ## Zsh 补全
 
