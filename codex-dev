@@ -1173,43 +1173,6 @@ exec_cmd() {
   run_container "$name" "$RW_ROOT" codex exec --cd /workspace --sandbox danger-full-access --ask-for-approval never "${prompt_args[*]}"
 }
 
-shell_words() {
-  local word
-  for word in "$@"; do
-    printf '%q ' "$word"
-  done
-}
-
-launch_host_terminal() {
-  local command_string terminal base
-  command_string="$(shell_words "$@")"
-  if [[ -n "${CODEX_DEV_TERMINAL:-}" ]]; then
-    # Test/user override. Keep this intentionally simple and deterministic:
-    # CODEX_DEV_TERMINAL may name an executable plus optional simple arguments.
-    # shellcheck disable=SC2206
-    local -a terminal_cmd=( $CODEX_DEV_TERMINAL )
-    [[ "${#terminal_cmd[@]}" -gt 0 ]] || die "CODEX_DEV_TERMINAL is empty."
-    "${terminal_cmd[@]}" -- bash -lc "$command_string" || die "Failed to launch terminal: ${terminal_cmd[*]}"
-    return 0
-  fi
-
-  for terminal in gnome-terminal kgx konsole xfce4-terminal xterm alacritty kitty; do
-    command -v "$terminal" >/dev/null 2>&1 || continue
-    base="$(basename "$terminal")"
-    case "$base" in
-      gnome-terminal|kgx)
-        "$terminal" -- bash -lc "$command_string" || die "Failed to launch terminal: $terminal"
-        ;;
-      konsole|xfce4-terminal|xterm|alacritty|kitty)
-        "$terminal" -e bash -lc "$command_string" || die "Failed to launch terminal: $terminal"
-        ;;
-      *) continue ;;
-    esac
-    return 0
-  done
-  die "No supported terminal launcher found. Set CODEX_DEV_TERMINAL to a terminal command."
-}
-
 attach_or_run() {
   local name="$1" rw_root="$2" cname state
   shift 2
@@ -1220,8 +1183,8 @@ attach_or_run() {
     state="$(podman inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || printf 'unknown')"
     case "$state" in
       running)
-        log "Opening terminal attached to running container: $cname"
-        launch_host_terminal podman exec -it "$cname" "$@"
+        log "Attaching current terminal to running container: $cname"
+        podman exec -it "$cname" "$@"
         ;;
       paused)
         die "Container '$cname' is paused. Unpause or stop it before using codex-dev attach."

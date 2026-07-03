@@ -146,7 +146,7 @@ codex-dev completion zsh [--command <absolute-path>]
 
 `codex-dev list` 是只读操作，会显示已有 build 记录的项目和容器状态。`codex-dev list -a` 也是只读操作，并会额外扫描 `${CODEX_DEV_PROJECTS_ROOT:-~/Projects}` 的直接子目录，通过 `.codex-dev/project.env` 识别已初始化项目。
 
-`codex-dev attach <shell|omx|codex|exec> ...` 会在宿主机再打开一个终端窗口，附着到同一个正在运行的项目容器并执行对应命令。如果项目容器未运行，则退回到当前终端中的普通命令启动流程。可设置 `CODEX_DEV_TERMINAL` 显式选择终端启动器。
+`codex-dev attach <shell|omx|codex|exec> ...` 会复用当前终端，附着到同一个正在运行的项目容器并执行对应命令。如果项目容器未运行，则退回到当前终端中的普通命令启动流程。
 
 ## Zsh 补全
 
@@ -203,4 +203,3 @@ whence -w _codex-dev
 ## 注意事项
 
 默认情况下运行时根文件系统是只读的。这使系统依赖变更保持明确且可复现，通过 `project.env` 与 `codex-dev build` 来管理。必要时可使用 `--rw-root` 进行一次性实验性 shell，但该模式仍不新增主机挂载。
-

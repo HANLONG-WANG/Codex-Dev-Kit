@@ -152,13 +152,7 @@ esac
 exit 0
 PODMAN
   chmod +x "$FAKEBIN/podman"
-  cat > "$FAKEBIN/fake-terminal" <<'TERM'
-#!/usr/bin/env bash
-printf '%q ' "$@" > "${TERMINAL_LOG:?}"
-printf '\n' >> "${TERMINAL_LOG:?}"
-TERM
-  chmod +x "$FAKEBIN/fake-terminal"
-  export CODEX_DEV_TERMINAL="$FAKEBIN/fake-terminal"
+  unset CODEX_DEV_TERMINAL
   export PATH="$FAKEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }
 
@@ -441,9 +435,10 @@ fi
 rm -f "$PODMAN_LOG" "$TERMINAL_LOG"
 export PODMAN_CONTAINER_EXISTS=1 PODMAN_CONTAINER_STATUS=running
 "$CODEX_DEV" attach codex app-one -- --model test-model
-terminal_log="$(cat "$TERMINAL_LOG")"
-assert_contains "$terminal_log" 'podman\ exec\ -it\ codex-dev-app-one-' 'attach running launches podman exec in terminal'
-assert_contains "$terminal_log" '--model\ test-model' 'attach codex preserves passthrough args'
+attach_log="$(cat "$PODMAN_LOG")"
+assert_contains "$attach_log" 'podman exec -it codex-dev-app-one-' 'attach running executes podman exec in current terminal'
+assert_contains "$attach_log" '--model test-model' 'attach codex preserves passthrough args'
+[[ ! -e "$TERMINAL_LOG" ]] && ok 'attach running does not launch a host terminal' || fail 'attach running launched a host terminal'
 rm -f "$PODMAN_LOG" "$TERMINAL_LOG"
 export PODMAN_CONTAINER_STATUS=paused
 if "$CODEX_DEV" attach shell app-one >/tmp/codex-dev-attach-paused.out 2>/tmp/codex-dev-attach-paused.err; then
@@ -451,13 +446,13 @@ if "$CODEX_DEV" attach shell app-one >/tmp/codex-dev-attach-paused.out 2>/tmp/co
 else
   ok 'attach paused container fails'
 fi
-[[ ! -e "$TERMINAL_LOG" ]] && ok 'attach paused does not launch terminal' || fail 'attach paused launched terminal'
+assert_not_contains "$(cat "$PODMAN_LOG" 2>/dev/null || true)" 'exec -it' 'attach paused does not execute attach payload'
 rm -f "$PODMAN_LOG" "$TERMINAL_LOG"
 export PODMAN_CONTAINER_EXISTS=0
 "$CODEX_DEV" attach omx app-one
 fallback_log="$(cat "$PODMAN_LOG")"
 assert_contains "$fallback_log" 'podman run' 'attach missing container falls back to normal run_container flow'
-assert_not_contains "$(cat "$TERMINAL_LOG" 2>/dev/null || true)" 'podman' 'attach missing container does not launch terminal'
+assert_not_contains "$fallback_log" 'podman exec -it' 'attach missing container does not execute direct attach'
 
 make_env
 if command -v zsh >/dev/null 2>&1; then
