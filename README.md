@@ -146,6 +146,8 @@ codex-dev completion zsh [--command <absolute-path>]
 
 `codex-dev list` is read-only and shows projects with existing build records plus their container status. `codex-dev list -a` is also read-only and additionally scans direct children of `${CODEX_DEV_PROJECTS_ROOT:-~/Projects}` for initialized projects (`.codex-dev/project.env`).
 
+`codex-dev list -a` is formatted for human terminal reading: each project is shown as a multi-line block with `path=`, `status=`, `container=`, `image=`, and `volumes=` fields, and built project volumes are listed one per line. Treat this output as a human-readable view, not a stable machine-readable API.
+
 `codex-dev attach <shell|omx|codex|exec> ...` reuses the current terminal to attach to the same running project container and runs the matching command there. If the project container is not running, it falls back to the normal command flow in the current terminal.
 
 ## Zsh completion

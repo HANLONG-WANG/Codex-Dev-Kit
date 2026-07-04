@@ -735,8 +735,28 @@ list_built_projects() {
   [[ "$found" -eq 1 ]] || log "No built projects under $BUILD_ROOT"
 }
 
+emit_list_all_project_block() {
+  local name="$1" path="$2" state="$3" status="$4" cname="$5" img="$6" vols="$7"
+  local vol
+
+  printf '%s  %s\n' "$name" "$state"
+  printf '  path=%s\n' "$path"
+  printf '  status=%s\n' "$status"
+  printf '  container=%s\n' "$cname"
+  printf '  image=%s\n' "$img"
+  if [[ "$vols" == "-" ]]; then
+    printf '  volumes=-\n'
+  else
+    printf '  volumes=\n'
+    local IFS=','
+    for vol in $vols; do
+      printf '    - %s\n' "$vol"
+    done
+  fi
+}
+
 list_all_projects() {
-  local rid name path status img cname vols project_name project_rid
+  local rid name path status img cname vols project_name project_rid sort_name first=1
   declare -A row_name=() row_path=() row_state=()
 
   while IFS= read -r rid; do
@@ -767,7 +787,8 @@ list_all_projects() {
     return 0
   fi
 
-  for rid in "${!row_name[@]}"; do
+  while IFS=$'\t' read -r sort_name rid; do
+    [[ -n "$rid" ]] || continue
     if [[ "${row_state[$rid]}" == "已build" ]]; then
       status="$(container_status_by_resource_id "$rid")"
       cname="$(container_name_from_resource_id "$rid")"
@@ -779,9 +800,17 @@ list_all_projects() {
       img="-"
       vols="-"
     fi
-    printf '%-28s  %-40s  %-8s  status=%s  container=%s  image=%s  volumes=%s\n' \
-      "${row_name[$rid]}" "${row_path[$rid]}" "${row_state[$rid]}" "$status" "$cname" "$img" "$vols"
-  done | sort
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+    else
+      printf '\n'
+    fi
+    emit_list_all_project_block "${row_name[$rid]}" "${row_path[$rid]}" "${row_state[$rid]}" "$status" "$cname" "$img" "$vols"
+  done < <(
+    for rid in "${!row_name[@]}"; do
+      printf '%s\t%s\n' "${row_name[$rid]}" "$rid"
+    done | sort -k1,1 -k2,2
+  )
 }
 
 candidate_matches_prefix() {

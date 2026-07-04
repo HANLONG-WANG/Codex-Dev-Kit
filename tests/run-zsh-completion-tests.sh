@@ -372,12 +372,31 @@ assert_contains "$list_out" 'localhost/codex-dev/app-one-' 'plain list includes 
 assert_not_contains "$list_out" 'api_two' 'plain list still excludes initialized-only api_two'
 [[ -e "$PODMAN_INVOKED_MARKER" ]] && ok 'plain list probes podman for built runtime status' || fail 'plain list did not probe podman status for built project'
 list_all_out="$($CODEX_DEV list -a)"
-assert_contains "$list_all_out" 'app-one' 'list -a includes built app-one'
-assert_contains "$list_all_out" '已build' 'list -a marks built state'
-assert_contains "$list_all_out" 'api_two' 'list -a includes initialized api_two'
-assert_contains "$list_all_out" '已init' 'list -a marks initialized state'
-assert_contains "$list_all_out" 'container=codex-dev-app-one-' 'list -a includes built container resource'
-assert_contains "$list_all_out" 'volumes=codex-dev-home-app-one-' 'list -a includes built volume resources'
+assert_contains "$list_all_out" 'app-one  已build' 'list -a includes built app-one block header'
+assert_contains "$list_all_out" "  path=$CODEX_DEV_PROJECTS_ROOT/app-one" 'list -a includes built project path field'
+assert_contains "$list_all_out" '  status=not-present' 'list -a includes built runtime status field'
+assert_contains "$list_all_out" '  container=codex-dev-app-one-' 'list -a includes built container field'
+assert_contains "$list_all_out" '  image=localhost/codex-dev/app-one-' 'list -a includes built image field'
+assert_has_line "$list_all_out" '  volumes=' 'list -a labels built volume list'
+assert_contains "$list_all_out" '    - codex-dev-home-app-one-' 'list -a prints built volumes as indented list items'
+assert_contains "$list_all_out" 'api_two  已init' 'list -a includes initialized api_two block header'
+assert_contains "$list_all_out" "  path=$CODEX_DEV_PROJECTS_ROOT/api_two" 'list -a includes initialized project path field'
+assert_contains "$list_all_out" '  status=-' 'list -a marks initialized status placeholder'
+assert_contains "$list_all_out" '  container=-' 'list -a marks initialized container placeholder'
+assert_contains "$list_all_out" '  image=-' 'list -a marks initialized image placeholder'
+assert_contains "$list_all_out" '  volumes=-' 'list -a marks initialized volumes placeholder'
+expected_list_all_prefix=$(cat <<EOF_LIST_ALL
+api_two  已init
+  path=$CODEX_DEV_PROJECTS_ROOT/api_two
+  status=-
+  container=-
+  image=-
+  volumes=-
+
+app-one  已build
+EOF_LIST_ALL
+)
+assert_contains "$list_all_out" "$expected_list_all_prefix" 'list -a keeps sorted project blocks separated by a blank line'
 assert_not_contains "$list_all_out" 'bad name' 'list -a excludes invalid names via shared helper'
 assert_not_contains "$list_all_out" 'linkproj' 'list -a excludes symlinked project dir via shared helper'
 assert_not_contains "$list_all_out" 'linkmeta' 'list -a excludes symlinked .codex-dev via shared helper'

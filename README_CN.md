@@ -146,6 +146,8 @@ codex-dev completion zsh [--command <absolute-path>]
 
 `codex-dev list` 是只读操作，会显示已有 build 记录的项目和容器状态。`codex-dev list -a` 也是只读操作，并会额外扫描 `${CODEX_DEV_PROJECTS_ROOT:-~/Projects}` 的直接子目录，通过 `.codex-dev/project.env` 识别已初始化项目。
 
+`codex-dev list -a` 面向人在终端中阅读：每个项目显示为多行块，包含 `path=`、`status=`、`container=`、`image=`、`volumes=` 字段，已 build 项目的卷会逐行列出。请把该输出视为人类可读视图，而不是稳定的机器可解析 API。
+
 `codex-dev attach <shell|omx|codex|exec> ...` 会复用当前终端，附着到同一个正在运行的项目容器并执行对应命令。如果项目容器未运行，则退回到当前终端中的普通命令启动流程。
 
 ## Zsh 补全
